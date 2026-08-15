@@ -35,12 +35,15 @@ if errorlevel 1 (
 
 echo.
 echo ============================================================
-echo  [2/4] Creating venv + checking/installing PyInstaller+pywebview
+echo  [2/4] Creating venv + checking/installing Python deps
 echo ============================================================
 rem The venv is fixed at Build\.venv, isolated from the global Python
 rem (does not pollute the system pip). All pip installs below use it.
+rem Dependencies come from requirements.txt (pinned versions) when it
+rem is present; otherwise installs the latest PyInstaller + pywebview.
 set "VENV_DIR=%~dp0.venv"
 set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
+set "REQ_FILE=%~dp0requirements.txt"
 if not exist "%VENV_PY%" (
   echo Creating virtual environment: %VENV_DIR%
   python -m venv "%VENV_DIR%"
@@ -54,32 +57,24 @@ if not exist "%VENV_PY%" (
 ) else (
   echo Virtual environment already exists: %VENV_DIR%
 )
-"%VENV_PY%" -m PyInstaller --version >nul 2>&1
+"%VENV_PY%" -c "import PyInstaller, webview" >nul 2>&1
 if errorlevel 1 (
-  echo PyInstaller not found in venv, installing via pip ...
-  "%VENV_PY%" -m pip install --upgrade pyinstaller
+  if exist "%REQ_FILE%" (
+    echo Installing deps from requirements.txt ...
+    "%VENV_PY%" -m pip install -r "%REQ_FILE%"
+  ) else (
+    echo requirements.txt not found, installing latest PyInstaller + pywebview ...
+    "%VENV_PY%" -m pip install --upgrade pyinstaller pywebview
+  )
   if errorlevel 1 (
-    echo [FAILED] PyInstaller install failed.
+    echo [FAILED] Python dependency install failed.
     echo          Check network connection or pip mirror.
     pause
     exit /b 1
   )
 ) else (
-  echo PyInstaller already installed:
+  echo Python deps already installed:
   "%VENV_PY%" -m PyInstaller --version
-)
-"%VENV_PY%" -c "import webview" >nul 2>&1
-if errorlevel 1 (
-  echo pywebview not found in venv, installing via pip ...
-  "%VENV_PY%" -m pip install pywebview
-  if errorlevel 1 (
-    echo [FAILED] pywebview install failed.
-    echo          Check network connection or pip mirror.
-    pause
-    exit /b 1
-  )
-) else (
-  echo pywebview already installed.
 )
 
 echo.
