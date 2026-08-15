@@ -5,23 +5,27 @@ rem Uses the venv created by 00_env.bat (Build\.venv); run 00_env.bat first.
 cd /d "%~dp0"
 
 rem Auto-clone the backend repo when missing (fresh machine bootstrap).
-rem Default location: <Build parent>\Source. Shallow clone (--depth 1) is
-rem enough for building; drop the flag if full history is needed.
-set "REPO_DEFAULT=%~dp0..\Source"
-if not exist "%REPO_DEFAULT%\.git" (
-  if not exist "%REPO_DEFAULT%" (
-    echo Repository not found, cloning deepseek-harness ...
-    git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git "%REPO_DEFAULT%"
-    if errorlevel 1 (
-      echo [FAILED] git clone failed.
-      pause
-      exit /b 1
-    )
-  ) else (
-    echo [FAILED] %REPO_DEFAULT% exists but is not a git repository.
+rem Any folder in the root dir holding package.json + .git counts as the
+rem repo (e.g. Source or deepseek-harness); if none is found, clones with
+rem the default name (deepseek-harness) into the root dir.
+set "ROOT=%~dp0.."
+set "REPO_FOUND="
+for /d %%d in ("%ROOT%\*") do (
+  if exist "%%d\package.json" if exist "%%d\.git" set "REPO_FOUND=%%d"
+)
+if not defined REPO_FOUND (
+  echo Repository not found, cloning deepseek-harness into %ROOT% ...
+  pushd "%ROOT%"
+  git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git
+  set "CLONE_OK=%errorlevel%"
+  popd
+  if not "%CLONE_OK%"=="0" (
+    echo [FAILED] git clone failed.
     pause
     exit /b 1
   )
+) else (
+  echo Repository found: %REPO_FOUND%
 )
 
 set "VENV_PY=%~dp0.venv\Scripts\python.exe"

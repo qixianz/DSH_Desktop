@@ -44,9 +44,20 @@ import time
 from pathlib import Path
 
 if getattr(sys, "frozen", False):
-    # 打包后 exe 位于仓库根目录, Build 目录在 exe 旁
+    # 打包后 exe 位于根目录, 构建目录 (原 Build) 在 exe 旁。
+    # 构建目录名不写死 (Build / DSH_Desktop / 任意克隆名均可): 自动探测
+    # exe 旁含 window/webview2_launcher.py 的目录。
     BASE = Path(sys.executable).resolve().parent
-    BUILD_DIR = BASE / "Build"
+    BUILD_DIR = None
+    try:
+        for child in sorted(BASE.iterdir()):
+            if child.is_dir() and (child / "window" / "webview2_launcher.py").is_file():
+                BUILD_DIR = child
+                break
+    except OSError:
+        BUILD_DIR = None
+    if BUILD_DIR is None:
+        BUILD_DIR = BASE / "Build"  # 回退: 默认名
     WINDOW_DIR = BUILD_DIR / "window"
 else:
     # 源码运行时脚本位于 Build/window/ 下; Build 目录 = 脚本目录的父级
