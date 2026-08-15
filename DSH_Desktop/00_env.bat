@@ -6,13 +6,13 @@ rem Pure-ASCII file: works under any code page (GBK / UTF-8 / ...).
 rem Designed for portability: on any machine that has Python + Node.js,
 rem run this once to:
 rem   [1] check Python
-rem   [2] create/reuse a venv at Build\.venv, then check / install
+rem   [2] create/reuse a venv at DSH_Desktop\.venv, then check / install
 rem       PyInstaller + pywebview inside the venv (needed by the exe)
 rem   [3] check OpenSSL DLLs (required for building the exe)
 rem   [4] set up the backend (Node): resolve repo via project-config.json,
 rem       ensure pnpm, then run "pnpm install" (build happens automatically
 rem       on exe start when the backend source changed)
-rem After that, run dsh-window-build.bat to build Deepseek Harness.exe
+rem After that, run 01_dsh-window-build.bat to build Deepseek Harness.exe
 cd /d "%~dp0"
 
 echo ============================================================
@@ -37,7 +37,7 @@ echo.
 echo ============================================================
 echo  [2/4] Creating venv + checking/installing Python deps
 echo ============================================================
-rem The venv is fixed at Build\.venv, isolated from the global Python
+rem The venv is fixed at DSH_Desktop\.venv, isolated from the global Python
 rem (does not pollute the system pip). All pip installs below use it.
 rem Dependencies come from requirements.txt (pinned versions) when it
 rem is present; otherwise installs the latest PyInstaller + pywebview.
@@ -96,8 +96,8 @@ echo ============================================================
 echo  [4/4] Setting up backend (Node repo via project-config.json)
 echo ============================================================
 rem Resolve repository path: project-config.json projectPath (override) or
-rem auto-detect a sibling dir of Build/ containing package.json + .git
-rem (fallback: <Build parent>\Source). resolve_repo.py prints one line.
+rem auto-detect a sibling dir of DSH_Desktop/ containing package.json + .git
+rem (fallback: <DSH_Desktop parent>\deepseek-harness). resolve_repo.py prints one line.
 for /f "usebackq delims=" %%i in (`python resolve_repo.py`) do set "REPO_DIR=%%i"
 if not defined REPO_DIR (
   echo [FAILED] Cannot resolve repository path from project-config.json.
@@ -111,6 +111,20 @@ if not exist "%REPO_DIR%\package.json" (
   pause
   exit /b 1
 )
+
+rem Write the shared paths file (all values relative to ROOT).
+rem Same format as 01_dsh-window-build.bat; read by resolve_repo.py / launcher.
+for %%a in ("%~dp0.") do set "BUILD_NAME=%%~nxa"
+for %%a in ("%REPO_DIR%") do set "REPO_NAME=%%~nxa"
+> "%~dp0paths.env" (
+  echo ROOT=.
+  echo BUILD_DIR=%BUILD_NAME%
+  echo WINDOW_DIR=%BUILD_NAME%\window
+  echo VENV_DIR=%BUILD_NAME%\.venv
+  echo REPO_DIR=%REPO_NAME%
+  echo EXE_NAME=Deepseek Harness.exe
+)
+echo Paths file written: %~dp0paths.env
 
 rem Ensure pnpm is available (Node 18+ ships corepack)
 where pnpm >nul 2>&1
@@ -152,7 +166,7 @@ cd /d "%~dp0"
 
 echo.
 echo ============================================================
-echo  [OK] Dependencies ready (venv: Build\.venv). The backend
+echo  [OK] Dependencies ready (venv: DSH_Desktop\.venv). The backend
 echo  will be built automatically on first exe run
 echo  (Deepseek Harness.exe).
 echo ============================================================

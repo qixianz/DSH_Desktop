@@ -3,15 +3,15 @@
 
 目录约定:
     <根目录>/
-        dsh.exe          <- 本程序 (打包后)
-        Source/          <- dsh 仓库 (git)
-        Build/           <- 本脚本 + last-build.txt 标记
+        Deepseek Harness.exe   <- 本程序 (打包后)
+        deepseek-harness/      <- dsh 仓库 (git)
+        DSH_Desktop/           <- 本脚本 + last-build.txt 标记
 
 每次启动流程:
     1. 计算后端源码指纹: HEAD 树 (git ls-tree -r HEAD)
        + 工作区内容改动 (git diff HEAD --raw, 含文件内容哈希)
        + gitignore 之外的 untracked 文件内容哈希
-    2. 与 Build/last-build.txt 记录的指纹对比
+    2. 与 DSH_Desktop/last-build.txt 记录的指纹对比
     3. 不一致 (或标记不存在) -> 弹构建窗口执行 `pnpm run build`,
        成功则记录新指纹
     4. 启动后端 `pnpm dsh web` (静默) -> 等待 3080 端口就绪
@@ -20,15 +20,15 @@
 
 窗口外观:
     frameless 无边框窗口 + WinForms 原生自绘标题栏 (Reasonix 风格):
-    左侧应用图标 (Build/deepseek娘.png), 右侧最小化/最大化/关闭按钮。
+    左侧应用图标 (DSH_Desktop/window/deepseek娘.png), 右侧最小化/最大化/关闭按钮。
     标题栏颜色通过 js_api.set_theme 跟随主程序主题 (body[data-ds-dark-theme]),
     配色对应前端 ui-theme design-platform.css 的 token。
     WebView2 用户数据目录固定到 %LOCALAPPDATA%/Deepseek Harness/WebView2,
     不在 exe 旁生成 "<exe>.WebView2"。
 
 前提:
-    - Source 内已执行过 `pnpm install`
-    - 已运行 Build\\00_env.bat (创建 Build\\.venv 并在其中安装
+    - deepseek-harness 内已执行过 `pnpm install`
+    - 已运行 DSH_Desktop\\00_env.bat (创建 DSH_Desktop\\.venv 并在其中安装
       pywebview + pyinstaller, 不污染全局 Python)
 """
 import ctypes
@@ -45,7 +45,7 @@ from pathlib import Path
 
 if getattr(sys, "frozen", False):
     # 打包后 exe 位于根目录, 构建目录 (原 Build) 在 exe 旁。
-    # 构建目录名不写死 (Build / DSH_Desktop / 任意克隆名均可): 自动探测
+    # 构建目录名不写死 (DSH_Desktop / 任意克隆名均可): 自动探测
     # exe 旁含 window/webview2_launcher.py 的目录。
     BASE = Path(sys.executable).resolve().parent
     BUILD_DIR = None
@@ -57,19 +57,19 @@ if getattr(sys, "frozen", False):
     except OSError:
         BUILD_DIR = None
     if BUILD_DIR is None:
-        BUILD_DIR = BASE / "Build"  # 回退: 默认名
+        BUILD_DIR = BASE / "DSH_Desktop"  # 回退: 默认名
     WINDOW_DIR = BUILD_DIR / "window"
 else:
-    # 源码运行时脚本位于 Build/window/ 下; Build 目录 = 脚本目录的父级
+    # 源码运行时脚本位于 DSH_Desktop/window/ 下; DSH_Desktop 目录 = 脚本目录的父级
     WINDOW_DIR = Path(__file__).resolve().parent
     BUILD_DIR = WINDOW_DIR.parent
     BASE = BUILD_DIR.parent
 
 
 def _load_project_config() -> Path | None:
-    """从 Build/project-config.json 读取项目仓库路径 (可选覆盖)。
+    """从 DSH_Desktop/project-config.json 读取项目仓库路径 (可选覆盖)。
 
-    字段 projectPath: 绝对路径, 或相对 Build 目录的相对路径 (如 "../Source")。
+    字段 projectPath: 绝对路径, 或相对 DSH_Desktop 目录的相对路径 (如 "../deepseek-harness")。
     文件缺失/损坏/字段缺失/为空返回 None, 由调用方走自动探测。"""
     try:
         import json as _json
@@ -86,8 +86,29 @@ def _load_project_config() -> Path | None:
         return None
 
 
+def _load_paths_file() -> dict[str, str] | None:
+    """读取 BUILD_DIR/paths.env（由 01/00 bat 生成）。
+
+    文件内所有值相对 ROOT（= BUILD_DIR 的父级）。缺失/损坏返回 None，
+    由调用方走 project-config.json / 自动探测。"""
+    p = BUILD_DIR / "paths.env"
+    try:
+        if not p.is_file():
+            return None
+        data: dict[str, str] = {}
+        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            data[k.strip()] = v.strip()
+        return data
+    except Exception:
+        return None
+
+
 def _find_repo() -> Path | None:
-    """自动探测仓库: 在 Build 同层级 (父目录) 下, 排除 Build 自身,
+    """自动探测仓库: 在 DSH_Desktop 同层级 (父目录) 下, 排除 DSH_Desktop 自身,
     找含 package.json + .git 的目录 (即 dsh 仓库)。多个时取字母序第一个。"""
     try:
         for child in sorted(BUILD_DIR.parent.iterdir()):
@@ -100,9 +121,19 @@ def _find_repo() -> Path | None:
     return None
 
 
-# 仓库定位顺序: 1) project-config.json 显式 projectPath (覆盖) 2) 自动探测
-# Build 同层级的仓库目录 3) 回退默认布局 <Build 上级>/Source
-SOURCE = _load_project_config() or _find_repo() or (BUILD_DIR.parent / "Source")
+# 仓库定位顺序: 1) paths.env (01/00 bat 生成, 值相对 ROOT) 2) project-config.json
+# 显式 projectPath (覆盖) 3) 自动探测 DSH_Desktop 同层级的仓库目录
+# 4) 回退默认布局 <DSH_Desktop 上级>/deepseek-harness
+_paths_cfg = _load_paths_file()
+_repo_from_paths = None
+if _paths_cfg and _paths_cfg.get("REPO_DIR"):
+    _cand = BASE / _paths_cfg["REPO_DIR"]
+    if (_cand / "package.json").is_file():
+        _repo_from_paths = _cand.resolve()
+SOURCE = (_repo_from_paths
+          or _load_project_config()
+          or _find_repo()
+          or (BUILD_DIR.parent / "deepseek-harness"))
 
 PORT = int(os.environ.get("DSH_PORT", "3080"))
 URL = f"http://127.0.0.1:{PORT}"
@@ -128,6 +159,12 @@ WEBVIEW2_DATA_BASE = (
 
 def _webview2_data_dir() -> Path:
     return WEBVIEW2_DATA_BASE / f"win-{os.getpid()}"
+
+
+# WebView2 官方兜底: 当 pywebview 的 CreationProperties.UserDataFolder 未生效时
+# (PyInstaller 打包后 pythonnet 属性赋值可能失效, 控件会落默认 <exe>.WebView2),
+# 该环境变量强制所有 WebView2 环境使用自定义用户数据目录, 不在 exe 旁生成目录。
+os.environ.setdefault("WEBVIEW2_USER_DATA_FOLDER", str(_webview2_data_dir()))
 
 
 def _prewarm_webview2_env() -> None:
@@ -242,7 +279,7 @@ def log(msg: str) -> None:
 
 
 def _resolve_dsh_home() -> str:
-    """复刻 Source/packages/util/home-paths/src/index.ts 的 resolveDshHome 规则,
+    """复刻 deepseek-harness/packages/util/home-paths/src/index.ts 的 resolveDshHome 规则,
     不写死路径 (多用户各自有 DSH_HOME 或 ~/.dsh):
       优先级: 显式配置 > $DSH_HOME (空/纯空白视为未设置) > ~/.dsh;
       支持 ~ / ~/ / ~\\ 前缀展开; 相对路径按当前工作目录绝对化。"""
@@ -259,7 +296,7 @@ def _resolve_dsh_home() -> str:
 def read_theme_preference() -> str | None:
     """从 Host 用户设置文档读取主题偏好 (ui-theme.preference: light/dark/system)。
 
-    文档路径同 Source/packages/settings/settings-file/src/index.ts 的默认:
+    文档路径同 deepseek-harness/packages/settings/settings-file/src/index.ts 的默认:
     <DSH_HOME>/settings.yaml (DSH_HOME 按 resolveDshHome 规则解析, 见
     _resolve_dsh_home)。这是应用自己持久化的偏好 (设置页 Appearance 行写入),
     优先于系统主题猜测: 用户配置 light/dark 与系统不一致时, 窗口首帧即正确。
@@ -1862,6 +1899,11 @@ def _patch_winforms_browser_form() -> None:
 
         def __init__(self, window, cache_dir):
             super().__init__(window, cache_dir)
+            # [DEBUG] 确认控件实际使用的用户数据目录 (诊断 <exe>.WebView2 来源)
+            try:
+                log(f"[DEBUG] EdgeChrome user_data_folder = {getattr(self.browser, 'user_data_folder', 'N/A')!r}, cache_dir arg = {cache_dir!r}")
+            except Exception as ex:
+                log(f"[DEBUG] user_data_folder read failed: {ex}")
             self.Load += self._on_dsh_load
             # 初始化完成的第一时间注册文档背景脚本: pywebview 在初始化完成后
             # 立即 load_url (首次导航), 脚本必须赶在导航前注册才能盖住首帧
@@ -1931,6 +1973,14 @@ def _patch_winforms_browser_form() -> None:
     _DshPreShowForm._dsh_patched = True
     wf.BrowserView.BrowserForm = _DshPreShowForm
     log("winforms BrowserForm patched (pre-show initial theme colors)")
+    # [DEBUG] 追踪 winforms cache_dir 的实际值 (诊断 <exe>.WebView2 来源)
+    _orig_init_storage = wf.init_storage
+
+    def _dsh_trace_init_storage():
+        _orig_init_storage()
+        log(f"[DEBUG] winforms init_storage -> cache_dir = {wf.cache_dir!r}")
+
+    wf.init_storage = _dsh_trace_init_storage
 
 
 def main() -> int:
@@ -2011,7 +2061,7 @@ def main() -> int:
     except ImportError as e:
         if started_by_us and proc is not None:
             kill_tree(proc.pid)
-        log(f"webview import failed: {e}; run 00_env.bat (creates Build/.venv with pywebview)")
+        log(f"webview import failed: {e}; run 00_env.bat (creates DSH_Desktop/.venv with pywebview)")
         return 1
 
     # 启动前 patch pywebview WinForms: BrowserForm 在 Load 事件 (窗口显示前)
@@ -2178,6 +2228,7 @@ def main() -> int:
     window.events.loaded += on_loaded
     # 清理已退出实例残留的独立 WebView2 数据目录 (本实例目录随窗口创建)
     _cleanup_old_webview2_dirs()
+    log(f"[DEBUG] storage_path passed to webview.start = {str(_webview2_data_dir())!r}")
     webview.start(storage_path=str(_webview2_data_dir()))
     log("launcher exiting")
     # 清理托盘 (进程即将退出, 图标随之消失)
