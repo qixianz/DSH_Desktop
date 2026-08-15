@@ -4,8 +4,13 @@
 # PyInstaller build work directory
 pyinstaller-build/
 
-# Build staging output (copied from Source during build)
-window/
+# Build staging output (copied from Source during build);
+# keep the launcher sources (tracked explicitly below)
+window/*
+!window/webview2_launcher.py
+!window/Deepseek Harness.spec
+!window/deepseek娘.png
+!window/deepseek娘.ico
 
 # Generated build state
 last-build.txt
