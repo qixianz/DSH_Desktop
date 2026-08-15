@@ -4,6 +4,26 @@ rem spec + launcher live in window\; output: ..\Deepseek Harness.exe
 rem Uses the venv created by 00_env.bat (Build\.venv); run 00_env.bat first.
 cd /d "%~dp0"
 
+rem Auto-clone the backend repo when missing (fresh machine bootstrap).
+rem Default location: <Build parent>\Source. Shallow clone (--depth 1) is
+rem enough for building; drop the flag if full history is needed.
+set "REPO_DEFAULT=%~dp0..\Source"
+if not exist "%REPO_DEFAULT%\.git" (
+  if not exist "%REPO_DEFAULT%" (
+    echo Repository not found, cloning deepseek-harness ...
+    git clone --depth 1 https://github.com/deepseek-ai/deepseek-harness.git "%REPO_DEFAULT%"
+    if errorlevel 1 (
+      echo [FAILED] git clone failed.
+      pause
+      exit /b 1
+    )
+  ) else (
+    echo [FAILED] %REPO_DEFAULT% exists but is not a git repository.
+    pause
+    exit /b 1
+  )
+)
+
 set "VENV_PY=%~dp0.venv\Scripts\python.exe"
 if not exist "%VENV_PY%" (
   echo [FAILED] venv not found: %VENV_PY%
