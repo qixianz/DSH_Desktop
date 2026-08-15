@@ -1,0 +1,4 @@
+{
+  "_comment": "项目仓库路径配置（可选）。不填 projectPath 时自动探测：在 Build 同层级下找含 package.json + .git 的目录（多个时取字母序第一个）；找不到则回退 <Build 上级>/Source。仅在需要覆盖自动探测结果时才填写：projectPath 为绝对路径，或相对本 Build 目录的相对路径（如 ../Source）。",
+  "projectPath": null
+}

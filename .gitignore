@@ -1,0 +1,16 @@
+# Python virtual environment
+.venv/
+
+# PyInstaller build work directory
+pyinstaller-build/
+
+# Build staging output (copied from Source during build)
+window/
+
+# Generated build state
+last-build.txt
+last-commit.txt
+
+# Python bytecode
+__pycache__/
+*.pyc
