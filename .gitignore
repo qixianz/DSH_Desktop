@@ -38,4 +38,8 @@ __pycache__/
 *.pyc
 
 # Release package output (built by 00release.bat)
-release/
+# Only the two build scripts are tracked (loss-proof against accidental delete);
+# everything else (portable tool cache, built exe/installer) is regenerable.
+release/*
+!release/00_release.bat
+!release/DSH_DESKTOP.iss
