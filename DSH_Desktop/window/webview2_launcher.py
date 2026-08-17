@@ -553,8 +553,14 @@ def needs_build() -> tuple[bool, str | None]:
 def run_build() -> bool:
     log("starting build (visible console window)")
     # 弹独立控制台窗口显示构建进度, 失败时暂停以便查看错误; 记录进程供取消时终止
+    # 显式 STARTUPINFO(SW_SHOWNORMAL=1) 确保窗口以正常状态显示:
+    # 不传时若进程通过 shell=True 创建会带 SW_HIDE; 打包 windowed exe 场景
+    # 下显式指定更稳妥, 构建窗口必须可见 (构建耗时较长, 用户要看进度)。
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 1  # SW_SHOWNORMAL
     p = subprocess.Popen(_build_cmd(), cwd=str(SOURCE), env=_node_env(),
-                         creationflags=subprocess.CREATE_NEW_CONSOLE)
+                         creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=si)
     _ACTIVE["proc"] = p
     try:
         p.wait()
