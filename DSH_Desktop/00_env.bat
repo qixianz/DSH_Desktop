@@ -12,7 +12,7 @@ rem   [3] check OpenSSL DLLs (required for building the exe)
 rem   [4] set up the backend (Node): resolve repo via project-config.json,
 rem       ensure pnpm, then run "pnpm install" (build happens automatically
 rem       on exe start when the backend source changed)
-rem After that, run 01_dsh-window-build.bat to build Deepseek Harness.exe
+rem After that, run 01_dsh-window-build.bat to build DSH_Desktop.exe
 cd /d "%~dp0"
 
 echo ============================================================
@@ -122,7 +122,7 @@ for %%a in ("%REPO_DIR%") do set "REPO_NAME=%%~nxa"
   echo WINDOW_DIR=%BUILD_NAME%\window
   echo VENV_DIR=%BUILD_NAME%\.venv
   echo REPO_DIR=%REPO_NAME%
-  echo EXE_NAME=Deepseek Harness.exe
+  echo EXE_NAME=DSH_Desktop.exe
 )
 echo Paths file written: %~dp0paths.env
 
@@ -168,6 +168,6 @@ echo.
 echo ============================================================
 echo  [OK] Dependencies ready (venv: DSH_Desktop\.venv). The backend
 echo  will be built automatically on first exe run
-echo  (Deepseek Harness.exe).
+echo  (DSH_Desktop.exe).
 echo ============================================================
 

@@ -3,7 +3,7 @@
 
 目录约定:
     <根目录>/
-        Deepseek Harness.exe   <- 本程序 (打包后)
+        DSH_Desktop.exe          <- 本程序 (打包后)
         deepseek-harness/      <- dsh 仓库 (git)
         DSH_Desktop/           <- 本脚本 + last-build.txt 标记
 
@@ -23,13 +23,15 @@
     左侧应用图标 (DSH_Desktop/window/deepseek娘.png), 右侧最小化/最大化/关闭按钮。
     标题栏颜色通过 js_api.set_theme 跟随主程序主题 (body[data-ds-dark-theme]),
     配色对应前端 ui-theme design-platform.css 的 token。
-    WebView2 用户数据目录固定到 %LOCALAPPDATA%/Deepseek Harness/WebView2,
-    不在 exe 旁生成 "<exe>.WebView2"。
+    WebView2 用户数据目录固定到 <安装根目录>/data/WebView2 (日志在 data/logs),
+    不写 C 盘、不在 exe 旁生成 "<exe>.WebView2"。
 
 前提:
     - deepseek-harness 内已执行过 `pnpm install`
     - 已运行 DSH_Desktop\\00_env.bat (创建 DSH_Desktop\\.venv 并在其中安装
       pywebview + pyinstaller, 不污染全局 Python)
+    - release 包自带便携 git + node (DSH_Desktop\\portable\\): 接收方无需
+      安装 git / node / pnpm; 源码/开发模式回退使用系统 git / node
 """
 import ctypes
 from ctypes import wintypes
@@ -135,26 +137,43 @@ SOURCE = (_repo_from_paths
           or _find_repo()
           or (BUILD_DIR.parent / "deepseek-harness"))
 
+# 官方仓库地址 (拉取默认走 SSH, 未配 SSH/失败时回退 HTTPS):
+# release 安装包不再携带后端仓库 (减小体积), 首次启动时用内嵌 git 从
+# 官方仓库 clone 到 SOURCE, 再 pnpm install + build。
+REPO_URL_SSH = "git@github.com:deepseek-ai/deepseek-harness.git"
+REPO_URL_HTTPS = "https://github.com/deepseek-ai/deepseek-harness.git"
+
 PORT = int(os.environ.get("DSH_PORT", "3080"))
 URL = f"http://127.0.0.1:{PORT}"
 # 用编译产物启动 (apps/cli/lib/bin.js): 1.3s 就绪, 对比 tsx 源码入口 18.6s。
 # 且无需 tsx/esbuild, 不 spawn 子进程, 无控制台窗口闪现。
 # 产物由 launcher 的 build 步骤 (pnpm run build) 生成; 缺失时会自动触发 rebuild。
-START_CMD = ["node", "apps/cli/lib/bin.js", "web"]
+
+# 包内便携 node: release 包自带, 接收方无需安装 node/pnpm 也能启动后端、
+# 拉取仓库/切换版本 (pnpm 本体在 node_modules 里, 用 node 直接跑 pnpm.cjs)。
+# Node 官方 zip 解压后顶层是 node-vXX-win-x64\, 打包时把内容放进 portable\node\。
+PORTABLE_NODE = BUILD_DIR / "portable" / "node" / "node.exe"
+# pnpm standalone 可执行文件 (pnpm-win32-x64.zip 里的 pnpm.exe, SEA 自带运行时):
+# 仓库 node_modules 里没有 pnpm 本体 (corepack/系统 pnpm 安装时不进依赖),
+# 所以 release 包自带。升级/重建时用它跑 install / run build。
+PORTABLE_PNPM = BUILD_DIR / "portable" / "pnpm" / "pnpm.exe"
+
 BACKEND_ENTRY = SOURCE / "apps" / "cli" / "lib" / "bin.js"
-BUILD_CMD = ["cmd", "/c", "pnpm run build && exit 0 || (echo. & echo [BUILD FAILED] 构建失败, 请查看上方错误信息. & pause)"]
 WAIT_TIMEOUT = int(os.environ.get("DSH_WAIT", "120"))  # 秒, 后端就绪等待上限
-LOG_FILE = Path(tempfile.gettempdir()) / "dsh-webview2.log"
+# 程序数据根目录 (安装根目录下的 data\ 文件夹): 日志、WebView2 用户数据等
+# 我们程序产生的数据一律放这里, 不进 C 盘; 默认装 D 盘时即 D:\DeepSeek Harness\data。
+# harness 后端自己的路径 (如 $DSH_HOME=~/.dsh) 由后端管理, 不在此列。
+DATA_DIR = BASE / "data"
+LOG_FILE = DATA_DIR / "logs" / "dsh-webview2.log"
 # 上次成功构建时的后端源码指纹 (与当前指纹对比决定是否重建)
 MARKER = BUILD_DIR / "last-build.txt"
-# WebView2 用户数据目录 (缓存/Cookie/GPUCache 等): 放到 %LOCALAPPDATA%,
-# 避免 WebView2 默认在 exe 旁生成 "<exe>.WebView2" 目录。
+# 升级通知"已读"标记: 记录用户已查看过的最新提交哈希 (红点据此显隐)
+SEEN_MARKER = BUILD_DIR / "last-update-seen.txt"
+# WebView2 用户数据目录 (缓存/Cookie/GPUCache 等): 放到 <根目录>\data\WebView2,
+# 避免 WebView2 默认在 exe 旁生成 "<exe>.WebView2" 目录、也不进 C 盘。
 # 每个实例用独立子目录 (带进程 PID): WebView2 数据目录同一时刻只允许一个
 # 浏览器进程组使用, 多窗口共享同一目录会让后开者初始化卡住 (白屏/打不开)。
-WEBVIEW2_DATA_BASE = (
-    Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()))
-    / "Deepseek Harness" / "WebView2"
-)
+WEBVIEW2_DATA_BASE = DATA_DIR / "WebView2"
 
 
 def _webview2_data_dir() -> Path:
@@ -232,11 +251,14 @@ TITLEBAR_THEMES = {
         "bg": (21, 21, 23), "hover": (47, 47, 49), "active": (64, 64, 66),
         "icon": (151, 157, 166), "close_hover": (239, 68, 68),
         "close_active": (196, 52, 52),
+        # 升级通知: 蓝色文字/下划线 (无背景色), hover 更亮
+        "upd": (96, 165, 250), "upd_hover": (147, 197, 253),
     },
     "light": {
         "bg": (249, 250, 251), "hover": (232, 232, 234), "active": (219, 219, 222),
         "icon": (97, 102, 107), "close_hover": (239, 68, 68),
         "close_active": (196, 52, 52),
+        "upd": (37, 99, 235), "upd_hover": (29, 78, 216),
     },
 }
 
@@ -272,6 +294,7 @@ THEME_SYNC_SCRIPT = """(() => {
 
 def log(msg: str) -> None:
     try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
     except OSError:
@@ -423,6 +446,25 @@ def kill_tree(pid: int) -> None:
     hidden_run(["taskkill", "/PID", str(pid), "/T", "/F"])
 
 
+def _kill_proc_tree(p) -> None:
+    """结束进程树并等待其退出 (最多 ~6s)。
+
+    taskkill 是异步的 (发出终止信号后进程还需时间退出, 尤其网络连接中的
+    git/ssh): 不等待就清理目录会撞文件锁, 下次启动 clone 会失败。"""
+    try:
+        kill_tree(p.pid)
+    except Exception:
+        pass
+    try:
+        p.wait(timeout=6)
+    except Exception:
+        # 进程树未在限时内退出 (卡在 I/O): 再杀一次兜底
+        try:
+            kill_tree(p.pid)
+        except Exception:
+            pass
+
+
 def get_workspace_fingerprint() -> str | None:
     """后端源码状态指纹 (纯内容级, 不含 commit 号)。
 
@@ -437,17 +479,24 @@ def get_workspace_fingerprint() -> str | None:
     import hashlib
 
     def _out(args: list[str]) -> str | None:
-        r = hidden_run(args, cwd=str(SOURCE), capture_output=True, text=True)
-        return r.stdout if r.returncode == 0 else None
+        try:
+            r = hidden_run(args, cwd=str(SOURCE), capture_output=True, text=True)
+            return r.stdout if r.returncode == 0 else None
+        except OSError:
+            # git 完全不可用 (既无便携 git 也无系统 git): 指纹算不出, 返回 None
+            return None
 
-    tree = _out(["git", "ls-tree", "-r", "HEAD"])
-    diff = _out(["git", "diff", "HEAD", "--raw"])
+    tree = _out([_git_bin(), "ls-tree", "-r", "HEAD"])
+    diff = _out([_git_bin(), "diff", "HEAD", "--raw"])
     if tree is None or diff is None:
         return None
     parts = [tree, diff]
     # gitignore 之外的 untracked 文件: 列出并逐个做内容哈希
-    r = hidden_run(["git", "ls-files", "--others", "--exclude-standard", "-z"],
-                   cwd=str(SOURCE), capture_output=True)
+    try:
+        r = hidden_run([_git_bin(), "ls-files", "--others", "--exclude-standard", "-z"],
+                       cwd=str(SOURCE), capture_output=True)
+    except OSError:
+        return None
     if r.returncode != 0:
         return None
     for name in r.stdout.decode("utf-8", "replace").split("\0"):
@@ -486,8 +535,11 @@ def needs_build() -> tuple[bool, str | None]:
         log("compiled entry missing, rebuild needed")
         return True, cur_fp
     if cur_fp is None:
-        log("cannot fingerprint Source, fallback: build")
-        return True, None
+        # 无法计算指纹 (git 完全不可用: 便携 git 缺失/损坏且无系统 git)。
+        # 编译产物已存在时信任打包的预构建产物, 不强制重建 —— 否则每次
+        # 启动都跑 pnpm build, 无 node/pnpm 的机器直接失败退出。
+        log("cannot fingerprint Source, trusting prebuilt artifacts (no rebuild)")
+        return False, None
     if last_fp is None:
         log("no last-build marker, first run -> build")
         return True, cur_fp
@@ -500,11 +552,341 @@ def needs_build() -> tuple[bool, str | None]:
 
 def run_build() -> bool:
     log("starting build (visible console window)")
-    # 弹独立控制台窗口显示构建进度, 失败时暂停以便查看错误
-    r = subprocess.run(BUILD_CMD, cwd=str(SOURCE),
-                       creationflags=subprocess.CREATE_NEW_CONSOLE)
-    ok = r.returncode == 0
+    # 弹独立控制台窗口显示构建进度, 失败时暂停以便查看错误; 记录进程供取消时终止
+    p = subprocess.Popen(_build_cmd(), cwd=str(SOURCE), env=_node_env(),
+                         creationflags=subprocess.CREATE_NEW_CONSOLE)
+    _ACTIVE["proc"] = p
+    try:
+        p.wait()
+    finally:
+        _ACTIVE["proc"] = None
+    ok = p.returncode == 0
     log(f"build finished, ok={ok}")
+    return ok
+
+
+def _repo_valid() -> bool:
+    """SOURCE 是否为完整有效的 git 仓库 (clone 已完成)。
+
+    仅看 package.json 不够: clone 中途取消时 package.json 可能已落地,
+    但 .git 不完整 / 缺文件, 后续 install/build 会出错。必须同时满足
+    package.json 存在 + .git 存在 + git rev-parse 能跑通。"""
+    if not (SOURCE / "package.json").is_file():
+        return False
+    if not (SOURCE / ".git").is_dir():
+        return False
+    try:
+        flags, si = _no_window_startup()
+        r = subprocess.run(
+            [_git_bin(), "-C", str(SOURCE), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=30,
+            creationflags=flags, startupinfo=si)
+        return r.returncode == 0 and r.stdout.strip() == "true"
+    except OSError:
+        return False
+
+
+def _git_worktree_ok() -> bool:
+    """SOURCE 内 git 是否可用 (rev-parse 能跑通), 不要求 package.json。
+
+    用于区分两类残留: "可断点续传的半成品 clone"(.git 有效, 保留接着拉)
+    与"完全无效残留"(无有效 .git, 需删除重来)。"""
+    if not (SOURCE / ".git").is_dir():
+        return False
+    try:
+        flags, si = _no_window_startup()
+        r = subprocess.run(
+            [_git_bin(), "-C", str(SOURCE), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=30,
+            creationflags=flags, startupinfo=si)
+        return r.returncode == 0 and r.stdout.strip() == "true"
+    except OSError:
+        return False
+
+
+def _clone_repo() -> bool:
+    """首次安装: 确保 SOURCE 是完整可用的官方仓库克隆 (支持断点续传)。
+
+    三段式: ①确保 .git 与 origin remote (缺失则 git init + config);
+    ②git fetch --depth 50 官方 master (对象级增量: 已下载对象跳过,
+    中断后下次启动接着拉, 不重复下载, 也不删除残留); ③git checkout
+    检出工作区 (detached HEAD, 强制覆盖)。带 SSH->HTTPS / 系统git->
+    便携git / 直连->系统代理 回退; 用户取消 (splash 关闭) 后立即终止;
+    fetch 失败保留 .git 供下次续传。"""
+    import queue as _queue
+    import re as _re
+    import shutil
+
+    def _clean_residue() -> bool:
+        """确保 SOURCE 可安全使用: 完整仓库直接放行; 半成品 git 仓库
+        (.git 有效) 保留用于断点续传; 只有完全无效 (无有效 .git) 的
+        残留才删除 (失败重试, 等待文件锁释放)。"""
+        if not SOURCE.is_dir():
+            return True
+        if _repo_valid():
+            return True
+        if _git_worktree_ok():
+            log("incomplete repo found (.git ok), keep for resume fetch")
+            return True
+        for attempt in range(5):
+            log(f"removing invalid residue (attempt {attempt + 1}/5): {SOURCE}")
+            try:
+                shutil.rmtree(str(SOURCE))
+            except Exception as ex:
+                log(f"residue cleanup failed: {ex}")
+            if not SOURCE.exists():
+                log("invalid residue removed")
+                return True
+            time.sleep(1.0)  # 等待文件锁释放 (刚杀死的 git/ssh 进程)
+        log("residue cleanup FAILED: directory still exists after retries")
+        return False
+
+    def _fetch_progress(line: str) -> tuple[float, str] | None:
+        """解析 git fetch 进度行 -> (splash 进度 5..30, 提示文字); 无关行 None。
+
+        进度映射 (完成后 main 从 30 进入依赖安装, 不倒退):
+        连接 5; Receiving 5..26; Resolving 26..27; 检出 27..30。"""
+        line = line.strip()
+        if not line:
+            return None
+        if "Receiving objects" in line:
+            m = _re.search(r"(\d+)%", line)
+            if m:
+                pct = int(m.group(1))
+                return 5.0 + 21.0 * pct / 100.0, f"正在下载代码 {pct}%…"
+        if "Resolving deltas" in line:
+            m = _re.search(r"(\d+)%", line)
+            if m:
+                pct = int(m.group(1))
+                return 26.0 + 1.0 * pct / 100.0, f"正在解析增量 {pct}%…"
+        if "Checking out files" in line or "Updating files" in line:
+            m = _re.search(r"(\d+)%", line)
+            if m:
+                pct = int(m.group(1))
+                return 27.0 + 3.0 * pct / 100.0, f"正在检出文件 {pct}%…"
+        return None
+
+    def _run_fetch(cmd: list[str], timeout: float) -> tuple[int, str]:
+        """执行 git fetch: 逐行解析 stderr 进度更新 splash, 带超时/取消。
+        返回 (returncode, 错误输出尾部); 取消/超时时已杀进程树。"""
+        flags, si = _no_window_startup()
+        try:
+            # --progress 强制进度输出到 stderr (管道模式 git 默认不输出);
+            # stdout 无内容, 直接丢弃
+            p = subprocess.Popen(cmd, cwd=str(BASE),
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE, text=True,
+                                 encoding="utf-8", errors="replace",
+                                 creationflags=flags, startupinfo=si)
+        except OSError as ex:
+            return -1, str(ex)
+        _ACTIVE["proc"] = p
+        q = _queue.Queue()
+
+        def _reader(p=p, q=q) -> None:
+            try:
+                for line in p.stderr:
+                    q.put(line)
+            except Exception:
+                pass
+            finally:
+                q.put(None)
+
+        threading.Thread(target=_reader, daemon=True).start()
+        rc = None
+        err_buf = []
+        deadline = time.time() + timeout
+        try:
+            while True:
+                if _ACTIVE["cancel"]:
+                    _kill_proc_tree(p)
+                    return -1, "cancelled"
+                remain = deadline - time.time()
+                if remain <= 0:
+                    _kill_proc_tree(p)
+                    return -1, f"fetch timeout ({timeout}s)"
+                try:
+                    line = q.get(timeout=min(remain, 0.5))
+                except _queue.Empty:
+                    continue
+                if line is None:
+                    break
+                prog = _fetch_progress(line)
+                if prog is not None:
+                    _splash_set_progress(prog[0], prog[1])
+                err_buf.append(line)
+            rc = p.wait(timeout=10)
+        except Exception as ex:
+            log(f"fetch wait failed: {ex}")
+        finally:
+            _ACTIVE["proc"] = None
+        if rc == 0:
+            return 0, ""
+        return rc, "".join(err_buf).strip()[-500:]
+
+    if not _clean_residue():
+        return False
+    candidates: list[str] = []
+    if _system_git_available():
+        candidates.append("git")
+    if PORTABLE_GIT.is_file():
+        candidates.append(str(PORTABLE_GIT))
+    if not candidates:
+        candidates = ["git"]
+    urls = [REPO_URL_SSH, REPO_URL_HTTPS]
+
+    # --- 1. 确保 .git 与 origin remote (断点续传基础) ---
+    SOURCE.mkdir(parents=True, exist_ok=True)
+    if not (SOURCE / ".git").is_dir():
+        log(f"initializing git repo at {SOURCE}")
+        flags, si = _no_window_startup()
+        r = subprocess.run([_git_bin(), "init", "-q", str(SOURCE)],
+                           capture_output=True, text=True, timeout=60,
+                           creationflags=flags, startupinfo=si)
+        if r.returncode != 0:
+            log("git init failed: " + (r.stderr or "")[-300:])
+            return False
+    _git(["config", "remote.origin.url", REPO_URL_SSH])
+    _git(["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"])
+
+    # 清理中断 fetch/clone 留下的不完整 pack (有 .pack 无对应 .idx):
+    # git negotiation 读到坏 pack 会直接报错, 导致"拉一小点就失败"
+    try:
+        pack_dir = SOURCE / ".git" / "objects" / "pack"
+        if pack_dir.is_dir():
+            for pf in pack_dir.glob("*.pack"):
+                if not pf.with_suffix(".idx").exists():
+                    pf.unlink(missing_ok=True)
+                    log(f"removed incomplete pack: {pf.name}")
+    except Exception as ex:
+        log(f"incomplete pack cleanup failed: {ex}")
+
+    # 清理 git 残留锁文件 (shallow.lock / index.lock / refs/**/*.lock):
+    # 上次 fetch 被取消/崩溃时可能留下, 不清理会导致后续所有 fetch 失败
+    # ("Another git process seems to be running in this repository")
+    try:
+        git_dir = SOURCE / ".git"
+        removed = 0
+        if git_dir.is_dir():
+            for lock in git_dir.glob("*.lock"):
+                lock.unlink(missing_ok=True)
+                removed += 1
+            refs = git_dir / "refs"
+            if refs.is_dir():
+                for lock in refs.rglob("*.lock"):
+                    lock.unlink(missing_ok=True)
+                    removed += 1
+        if removed:
+            log(f"removed {removed} stale git lock file(s)")
+    except Exception as ex:
+        log(f"git lock cleanup failed: {ex}")
+
+    # --- 2. fetch 官方 master (增量续传: 已下载对象跳过) ---
+    _splash_set_progress(5, "正在连接远程仓库…")
+    last_err = ""
+    fetched = False
+    for ui, url in enumerate(urls):
+        if _ACTIVE["cancel"]:
+            log("fetch aborted by user")
+            return False
+        for idx, bin_ in enumerate(candidates):
+            if _ACTIVE["cancel"]:
+                log("fetch aborted by user")
+                return False
+            for proxy in [None] + list(_git_proxy_candidates()):
+                if _ACTIVE["cancel"]:
+                    log("fetch aborted by user")
+                    return False
+                # 注意: -c 是 git 全局选项, 必须放在子命令 (fetch) 之前!
+                # clone 子命令自带 -c 选项可以放后面, 但 fetch 不认 -c
+                # (会报 "error: unknown switch `c'" 并打印 usage)。
+                cmd = [bin_, "-C", str(SOURCE)]
+                if proxy:
+                    cmd += ["-c", "http.proxy=" + proxy]
+                if url == REPO_URL_SSH:
+                    cmd += ["-c", "core.sshCommand=ssh -o StrictHostKeyChecking=accept-new"]
+                cmd += ["fetch", "--depth", "50", "--progress", "--no-tags",
+                        url, "master:refs/remotes/origin/master"]
+                # SSH 未配 key/被墙时常卡在连接阶段: 短超时快速回退 HTTPS
+                # (45s: 用户网络 SSH 握手常需 30s+, 超过基本没戏)
+                timeout = 45 if url == REPO_URL_SSH else 1800
+                rc, err = _run_fetch(cmd, timeout)
+                if _ACTIVE["cancel"]:
+                    log("fetch aborted by user")
+                    return False
+                if rc == 0:
+                    fetched = True
+                    log(f"fetched official repo (url={url}, git={bin_}, proxy={proxy or 'direct'})")
+                    break
+                last_err = err or f"rc={rc}"
+                log(f"fetch attempt (url={url}, git={bin_}, proxy={proxy or 'direct'}) failed: {last_err}")
+            if fetched:
+                break
+        if fetched:
+            break
+    if not fetched:
+        # fetch 失败: 保留 .git (下次启动断点续传), 不删除
+        log(f"fetch failed: {last_err}")
+        # 顺手清理本次尝试可能留下的 lock (如连接中断), 保证下次启动能继续
+        try:
+            git_dir = SOURCE / ".git"
+            if git_dir.is_dir():
+                for lock in git_dir.glob("*.lock"):
+                    lock.unlink(missing_ok=True)
+                refs = git_dir / "refs"
+                if refs.is_dir():
+                    for lock in refs.rglob("*.lock"):
+                        lock.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+    # --- 3. checkout 检出工作区 (detached HEAD, 强制覆盖) ---
+    _splash_set_progress(27, "正在检出文件…")
+    co = _git(["checkout", "-q", "-f", "origin/master"], timeout=300)
+    if co[0] != 0:
+        log("checkout failed: " + (co[2].strip() or "unknown")[:300])
+        return False
+    if not _repo_valid():
+        log("repo invalid after checkout")
+        return False
+    log("official repo ready (resume-safe)")
+    return True
+
+
+def _install_deps() -> bool:
+    """首次安装: pnpm install (内嵌 pnpm + node), 依赖 store 放 data 目录不占 C 盘。
+
+    用 list 模式直接调 pnpm (不经 cmd /S /c): 后者嵌套引号会把
+    --store-dir "path with spaces" 的结尾引号解析给 pnpm, 导致
+    mkdir '...pnpm-store"\v11' ENOENT 失败。"""
+    flags, si = _no_window_startup()
+    p = subprocess.Popen(
+        _pnpm_list(["install", "--config.confirmModulesPurge=false",
+                    "--store-dir", str(DATA_DIR / "pnpm-store")]),
+        cwd=str(SOURCE), env=_node_env(),
+        stdin=subprocess.PIPE,  # 自动应答任何交互确认 (默认 y, 不弹提示)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+        creationflags=flags, startupinfo=si)
+    _ACTIVE["proc"] = p
+    try:
+        try:
+            out, err = p.communicate(input="y\n", timeout=1800)
+        except subprocess.TimeoutExpired:
+            try:
+                kill_tree(p.pid)
+            except Exception:
+                pass
+            out, err = "", "pnpm install timeout"
+    finally:
+        _ACTIVE["proc"] = None
+    ok = p.returncode == 0 and (SOURCE / "node_modules" / ".modules.yaml").is_file()
+    if not ok:
+        # 输出可能落在 stdout 或 stderr (pnpm 错误常在 stdout 打印)
+        log(f"pnpm install failed (rc={p.returncode}): {(err or '')[-800:]} {(out or '')[-800:]}")
+    else:
+        log("pnpm install OK")
     return ok
 
 
@@ -516,9 +898,13 @@ def start_backend() -> subprocess.Popen | None:
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = subprocess.SW_HIDE
     p = subprocess.Popen(
-        START_CMD, cwd=str(SOURCE), creationflags=flags, startupinfo=si,
+        _start_cmd(), cwd=str(SOURCE), env=_node_env(),
+        creationflags=flags, startupinfo=si,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+    # 登记为当前活动子进程: splash 关闭按钮 (_cancel_startup) 能直接
+    # 杀掉等待就绪阶段的后端, 不依赖 main 循环的检查时机。
+    _ACTIVE["proc"] = p
     return p
 
 
@@ -684,7 +1070,7 @@ def _hide_main_window() -> None:
         try:
             from System.Windows.Forms import ToolTipIcon
             if _TRAY is not None:
-                _TRAY.ShowBalloonTip(1500, "DeepSeek Harness",
+                _TRAY.ShowBalloonTip(1500, "DSH Desktop",
                                      "已最小化到托盘, 双击图标恢复窗口",
                                      ToolTipIcon.Info)
         except Exception:
@@ -761,7 +1147,7 @@ def _setup_tray(form) -> None:
         icon_path = WINDOW_DIR / "deepseek娘.ico"
         if icon_path.is_file():
             ni.Icon = _GIcon(str(icon_path))
-        ni.Text = "DeepSeek Harness"
+        ni.Text = "DSH Desktop"
         ni.Visible = True
         menu = ContextMenuStrip()
         show_item = ToolStripMenuItem("显示窗口")
@@ -895,6 +1281,15 @@ class TitleBar:
         self._drag_start = None    # 按下点屏幕坐标 (GPoint)
         self._drag_offset_x = 0    # 还原后鼠标在窗口内的抓取偏移
         self._drag_offset_y = 0
+        # 升级通知状态: 后台线程检测到官方新提交后 set_update_info 填充
+        self._update_info = None       # check_for_update 结果 dict / None
+        self._update_rect = None       # 通知文字命中区 (RectangleF, None=不显示)
+        self._update_hover = False
+        self._update_pressed = False
+        self._upd_font = None          # 通知文字字体 (缓存)
+        self._upd_thread_started = False
+        self._update_dialog_open = False
+        self._update_seen_hash = _read_update_seen()  # 已读的最新提交 (红点判断)
 
     def install(self) -> None:
         from System.Windows.Forms import DockStyle, ControlStyles
@@ -908,6 +1303,16 @@ class TitleBar:
         self._scale = max(1.0, user32.GetDpiForWindow(hwnd) / 96.0)
         self._tb_h = int(TITLEBAR_HEIGHT * self._scale)
         self._btn_w = int(BTN_WIDTH * self._scale)
+        # 升级通知文字字体 (9pt, GDI+ 按屏幕 DPI 自动缩放; 微软雅黑缺失时回落系统字体)
+        try:
+            from System.Drawing import Font, FontStyle, SystemFonts
+            self._upd_font = Font("Microsoft YaHei UI", 9.0, FontStyle.Regular)
+        except Exception:
+            try:
+                from System.Drawing import SystemFonts
+                self._upd_font = SystemFonts.MessageBoxFont
+            except Exception:
+                self._upd_font = None
         # DWM 属性: 边框颜色跟随主题 + 最大化时禁用非客户区渲染(阴影/1px 边框)
         from ctypes import wintypes as _wt
         self._dwmapi = ctypes.WinDLL("dwmapi")
@@ -1249,6 +1654,126 @@ class TitleBar:
             icon_rgb = (255, 255, 255) if idx == 2 and self._hover == idx else c["icon"]
             self._draw_icon(g, kind, cx, cy, icon_rgb)
 
+        # 升级按钮: 最小化按钮左侧常驻 (灰色=无更新, 蓝色=有更新 + 红点)。
+        # 点击: 有更新 -> 升级对话框 (更新日志+版本选择); 无更新 -> 已是最新提示。
+        self._draw_update_notice(g, self._update_info)
+
+    def _draw_update_notice(self, g, info) -> None:
+        """绘制常驻"检查更新"按钮 (最小化按钮左侧, 无背景色):
+        图标 + "检查更新"文字, 平时灰色; 有更新时变蓝色 + 红点 (点击一次后消失)。"""
+        from System.Drawing import Pen, SolidBrush, RectangleF
+        from System.Drawing.Drawing2D import SmoothingMode, LineCap
+        from System.Drawing.Text import TextRenderingHint
+        c = TITLEBAR_THEMES["dark" if self._dark else "light"]
+        font = self._upd_font
+        if font is None:
+            return
+        available = bool(info and info.get("available"))
+        hover = bool(self._update_hover)
+        if available:
+            color = c["upd_hover"] if hover else c["upd"]
+        else:
+            color = c["upd_hover"] if hover else c["icon"]
+        text = "检查更新"
+        brush = SolidBrush(self._rgb(color))
+        try:
+            size = g.MeasureString(text, font)
+            w = self.form.ClientSize.Width
+            margin = 10.0 * self._scale
+            right = w - 3 * self._btn_w - margin      # 最小化按钮左侧
+            s = self._scale
+            icon_w = 14.0 * s
+            gap = 5.0 * s
+            total_w = icon_w + gap + size.Width
+            x_icon = right - total_w
+            min_x = 48.0 * s                          # 应用图标右侧留白
+            if x_icon < min_x:
+                x_icon = min_x
+                if x_icon + total_w > right:
+                    self._update_rect = None           # 窗口太窄, 画不下
+                    return
+            cy = self._tb_h / 2.0
+            # 图标: 向上箭头 (更新)
+            g.SmoothingMode = SmoothingMode.AntiAlias
+            pen = Pen(self._rgb(color), max(1.0, 1.4 * s))
+            pen.StartCap = LineCap.Round
+            pen.EndCap = LineCap.Round
+            ix = x_icon + icon_w / 2.0
+            try:
+                g.DrawLine(pen, ix, cy + 4.0 * s, ix, cy - 2.5 * s)
+                g.DrawLine(pen, ix, cy - 5.5 * s, ix - 3.2 * s, cy - 0.8 * s)
+                g.DrawLine(pen, ix, cy - 5.5 * s, ix + 3.2 * s, cy - 0.8 * s)
+            finally:
+                pen.Dispose()
+            # 文字 "检查更新"
+            x_text = x_icon + icon_w + gap
+            y_text = (self._tb_h - size.Height) / 2.0
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit
+            g.DrawString(text, font, brush, x_text, y_text)
+            # 红点: 有更新且未读 (点击一次后消失, 持久化)
+            if available and self._show_update_badge(info):
+                r = 3.5 * s
+                bx = x_icon + icon_w - 1.0 * s
+                by = 5.0 * s
+                red = SolidBrush(self._rgb((239, 68, 68)))
+                try:
+                    g.FillEllipse(red, bx - r, by - r, 2 * r, 2 * r)
+                finally:
+                    red.Dispose()
+            self._update_rect = RectangleF(
+                x_icon - 4.0 * s, 0,
+                total_w + 8.0 * s, self._tb_h)
+        finally:
+            brush.Dispose()
+
+    def _show_update_badge(self, info) -> bool:
+        """红点是否显示: 有更新 且 最新提交 != 已读记录 (点击一次后消失)。"""
+        latest = (info or {}).get("latest") or ""
+        return bool(latest) and latest != self._update_seen_hash
+
+    def _mark_update_seen(self, latest_hash: str) -> None:
+        """记录已读 (打开升级对话框时调用), 红点消失并持久化到文件。"""
+        self._update_seen_hash = latest_hash
+        try:
+            SEEN_MARKER.write_text(latest_hash + "\n", encoding="utf-8")
+        except OSError as ex:
+            log(f"update seen marker write failed: {ex}")
+        self._invalidate_titlebar()
+
+    def _show_updating_overlay(self) -> None:
+        """切换版本期间: 向 webview 页面注入全屏覆盖层 (主题色跟随页面变量)。
+
+        后台线程调用, 内部封送 UI 线程; CoreWebView2 只能 UI 线程访问。"""
+        def _inject() -> None:
+            try:
+                core = self._webview_ctrl.CoreWebView2
+                if core is not None:
+                    core.ExecuteScriptAsync(_UPDATING_OVERLAY_JS)
+                    log("updating overlay injected")
+            except Exception as ex:
+                log(f"updating overlay inject failed: {ex}")
+        try:
+            from System import Action
+            self.form.Invoke(Action(_inject))
+        except Exception as ex:
+            log(f"updating overlay marshal failed: {ex}")
+
+    def _hide_updating_overlay(self) -> None:
+        """移除切换版本覆盖层 (UI 线程封送)。"""
+        def _inject() -> None:
+            try:
+                core = self._webview_ctrl.CoreWebView2
+                if core is not None:
+                    core.ExecuteScriptAsync(_UPDATING_OVERLAY_HIDE_JS)
+                    log("updating overlay removed")
+            except Exception as ex:
+                log(f"updating overlay hide failed: {ex}")
+        try:
+            from System import Action
+            self.form.Invoke(Action(_inject))
+        except Exception as ex:
+            log(f"updating overlay hide marshal failed: {ex}")
+
     def _draw_icon(self, g, kind: int, cx: float, cy: float, rgb) -> None:
         """kind: 0=min 1=max 2=restore 3=close
         手绘窗口图标, 以按钮中心 (cx, cy) 垂直居中, 整体缩小一档。"""
@@ -1316,19 +1841,36 @@ class TitleBar:
             except Exception as ex:
                 log(f"fullscreen drag move failed: {ex}")
                 return
+        # 升级通知悬停: 高亮文字 + 手型光标 (仅在通知区域内)
+        hit_u = self._hit_update(e.X, e.Y)
+        if hit_u != self._update_hover:
+            self._update_hover = hit_u
+            try:
+                from System.Windows.Forms import Cursors
+                self.form.Cursor = Cursors.Hand if hit_u else Cursors.Default
+            except Exception:
+                pass
+            self._invalidate_titlebar()
         idx = self._hit_button(e.X, e.Y)
         if idx != self._hover:
             self._hover = idx
             self._invalidate_titlebar()
 
     def _on_mouse_leave(self, sender, e) -> None:
-        if self._hover != -1 or self._pressed != -1:
+        if self._hover != -1 or self._pressed != -1 or self._update_hover or self._update_pressed:
             self._hover = -1
             self._pressed = -1
+            self._update_hover = False
+            self._update_pressed = False
             self._invalidate_titlebar()
 
     def _on_mouse_down(self, sender, e) -> None:
         log(f"titlebar mousedown x={e.X} y={e.Y} clicks={e.Clicks}")
+        # 升级通知区域: 按下进入按下态 (不触发窗口拖动/最大化)
+        if self._hit_update(e.X, e.Y):
+            self._update_pressed = True
+            self._invalidate_titlebar()
+            return
         idx = self._hit_button(e.X, e.Y)
         if idx != -1:
             self._pressed = idx
@@ -1411,6 +1953,14 @@ class TitleBar:
                 mi.rcWork.right - mi.rcWork.left, mi.rcWork.bottom - mi.rcWork.top)
 
     def _on_mouse_up(self, sender, e) -> None:
+        # 升级通知: 松开时仍在区域内 -> 弹出升级对话框
+        was_u = self._update_pressed
+        if was_u:
+            self._update_pressed = False
+            self._invalidate_titlebar()
+            if self._hit_update(e.X, e.Y):
+                self._open_update_dialog()
+            return
         idx = self._hit_button(e.X, e.Y)
         was = self._pressed
         self._pressed = -1
@@ -1436,6 +1986,230 @@ class TitleBar:
             # 不吞异常: 记录后重抛, 让 WinForms 事件分发可见 (否则点击"没反应")
             log(f"titlebar button action failed idx={idx}: {ex}")
             raise
+
+    # ---------- 升级通知 (检测/绘制/点击) ----------
+
+    def _hit_update(self, x: int, y: int) -> bool:
+        """x/y (窗口客户坐标) 是否命中升级通知区域。"""
+        r = self._update_rect
+        return r is not None and r.Contains(x, y)
+
+    def set_update_info(self, info) -> None:
+        """更新检测结果 (后台线程调用, 内部封送 UI 线程)。
+
+        info=None 表示检测失败 (保持现状); available=False 表示无更新 (隐藏提示)。"""
+        def _apply() -> None:
+            self._update_info = info
+            self._update_hover = False
+            self._update_pressed = False
+            if not info or not info.get("available"):
+                self._update_rect = None
+            self._invalidate_titlebar()
+            # 演示模式自动弹出对话框 (仅测试钩子, 正常模式不受影响)
+            if (info and info.get("demo")
+                    and os.environ.get("DSH_DEMO_UPDATE_AUTOOPEN")):
+                self._schedule_demo_open()
+        try:
+            from System import Action
+            self.form.Invoke(Action(_apply))
+        except Exception as ex:
+            log(f"set_update_info failed: {ex}")
+
+    def _schedule_demo_open(self) -> None:
+        """演示模式下延迟自动弹出升级对话框 (验证 UI 用, 非生产路径)。"""
+        def _later() -> None:
+            time.sleep(2.0)
+            try:
+                from System import Action
+                self.form.Invoke(Action(self._open_update_dialog))
+            except Exception:
+                pass
+        threading.Thread(target=_later, daemon=True).start()
+
+    def _open_update_dialog(self) -> None:
+        if self._update_dialog_open:
+            return
+        self._update_dialog_open = True
+        try:
+            info = self._update_info
+            # 总是打开版本列表界面 (git 样式): 不管有没有更新都可选历史版本切换。
+            # 有更新时先标记已读 (红点消失, 持久化)。
+            if info and info.get("available"):
+                latest = info.get("latest") or ""
+                if latest:
+                    self._mark_update_seen(latest)
+            show_update_dialog(self)
+        except Exception as ex:
+            log(f"update dialog open failed: {ex}")
+            try:
+                from System.Windows.Forms import MessageBox, MessageBoxButtons, MessageBoxIcon
+                MessageBox.Show(self.form, f"无法打开升级窗口: {ex}", "升级",
+                                MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            except Exception:
+                pass
+        finally:
+            self._update_dialog_open = False
+
+    def _show_up_to_date_dialog(self) -> None:
+        """无更新时点击灰色按钮: "已是最新"提示对话框 (含立即重新检测)。"""
+        from System.Windows.Forms import (
+            Form, Label, Button, FormBorderStyle)
+        from System.Drawing import Color, Point, Size, Font
+        dark = self._dark
+        s = self._scale
+        info = self._update_info
+
+        form = Form()
+        form.Text = "检查更新"
+        form.FormBorderStyle = FormBorderStyle(0)  # None (python 关键字冲突, 用枚举构造)
+        try:
+            from System import Enum as _Enum
+            form.StartPosition = _Enum.ToObject(form.StartPosition.GetType(), 4)
+        except Exception:
+            pass
+        form.ShowInTaskbar = False
+        form.MaximizeBox = False
+        form.MinimizeBox = False
+        form.ClientSize = Size(int(480 * s), int(210 * s))
+        try:
+            form.Font = Font("Microsoft YaHei UI", 9.5)
+        except Exception:
+            pass
+        # 自绘标题栏 (主题色背景 + 图标 + 标题 + 关闭按钮, 可拖动)
+        tb = _install_dialog_chrome(form, "检查更新", dark, s,
+                                    lambda: form.Close())
+        form.ClientSize = Size(int(480 * s), int(210 * s) + tb)
+
+        # 无边框窗口: DWM 圆角 + 边框色 = 主题背景色 (与主窗口一致)
+        _theme_bg = TITLEBAR_THEMES["dark" if dark else "light"]["bg"]
+
+        def _apply_dwm(_s=None, _e=None) -> None:
+            try:
+                hwnd = form.Handle.ToInt32()
+                _dwm = ctypes.WinDLL("dwmapi")
+                _dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+                _dwm.DwmSetWindowAttribute.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+                col = ctypes.c_int((_theme_bg[2] << 16) | (_theme_bg[1] << 8) | _theme_bg[0])
+                _dwm.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(col), 4)
+                corner = ctypes.c_int(2)
+                _dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner), 4)
+            except Exception as ex:
+                log(f"up-to-date dialog dwm failed: {ex}")
+
+        form.Shown += _apply_dwm
+        if dark:
+            form.BackColor = Color.FromArgb(21, 21, 23)
+            form.ForeColor = Color.FromArgb(229, 231, 235)
+
+        def theme(ctrl) -> None:
+            if dark:
+                ctrl.BackColor = Color.FromArgb(30, 30, 33)
+                ctrl.ForeColor = Color.FromArgb(229, 231, 235)
+
+        head = Label()
+        head.SetBounds(int(22 * s), int(24 * s) + tb, int(436 * s), int(44 * s))
+        head.AutoSize = False
+        if info is None:
+            head.Text = "尚未完成更新检测（网络不可用？）。点击\"立即重新检测\"重试。"
+        else:
+            head.Text = (f"当前已是最新版本（{info.get('head_short', '?')}）。"
+                         "官方仓库暂无新提交。")
+        theme(head)
+        form.Controls.Add(head)
+
+        status = Label()
+        status.SetBounds(int(22 * s), int(76 * s) + tb, int(436 * s), int(44 * s))
+        status.AutoSize = False
+        status.Text = "有更新时会变为蓝色并显示红点，点击可查看更新日志并选择版本。"
+        status.ForeColor = Color.FromArgb(148, 163, 184) if dark else Color.Gray
+        form.Controls.Add(status)
+
+        btn_close = Button()
+        btn_close.SetBounds(int(480 * s - 22 * s - 92 * s), int(140 * s) + tb, int(92 * s), int(32 * s))
+        btn_close.Text = "关闭"
+        form.Controls.Add(btn_close)
+
+        btn_check = Button()
+        btn_check.SetBounds(int(480 * s - 22 * s - 192 * s), int(140 * s) + tb, int(92 * s), int(32 * s))
+        btn_check.Text = "立即重新检测"
+        form.Controls.Add(btn_check)
+
+        def _done(info2) -> None:
+            try:
+                if form.IsDisposed:
+                    return
+                if info2 is None:
+                    status.Text = "检测失败（网络不可用？），请检查代理设置后重试。"
+                    btn_check.Enabled = True
+                    btn_close.Enabled = True
+                    return
+                if info2.get("available"):
+                    form.Close()
+                    self.set_update_info(info2)
+                    # 直接打开升级对话框 (绕过 _update_dialog_open 标志, 已在打开中)
+                    show_update_dialog(self)
+                    return
+                status.Text = f"仍然是最新（{info2.get('head_short', '?')}）。"
+                btn_check.Enabled = True
+                btn_close.Enabled = True
+            except Exception as ex:
+                log(f"recheck done failed: {ex}")
+
+        def _recheck(_s, _e) -> None:
+            btn_check.Enabled = False
+            btn_close.Enabled = False
+            status.Text = "正在检测官方仓库…"
+            log("manual re-check requested")
+
+            def _work() -> None:
+                info2 = check_for_update()
+                try:
+                    from System import Action
+                    form.Invoke(Action(lambda: _done(info2)))
+                except Exception:
+                    pass
+
+            threading.Thread(target=_work, daemon=True).start()
+
+        btn_close.Click += lambda s, e: form.Close()
+        btn_check.Click += _recheck
+        form.ShowDialog(self.form)
+        try:
+            form.Dispose()
+        except Exception:
+            pass
+
+    def start_update_checker(self) -> None:
+        """后台线程: 定期检测官方仓库 (origin/master) 更新。
+
+        首个检测延迟 DSH_UPDATE_FIRST_DELAY 秒 (默认 12, 让启动/构建先完成),
+        之后每 DSH_UPDATE_INTERVAL 秒一次 (默认 1800 = 30 分钟)。
+        检测失败 (断网等) 不改变现有提示状态。"""
+        if self._upd_thread_started:
+            return
+        self._upd_thread_started = True
+        first_delay = float(os.environ.get("DSH_UPDATE_FIRST_DELAY", "12"))
+        interval = float(os.environ.get("DSH_UPDATE_INTERVAL", "1800"))
+
+        def _loop() -> None:
+            try:
+                time.sleep(first_delay)
+                while True:
+                    info = check_for_update()
+                    if info is None:
+                        log("update check failed (network/repo), keep current state")
+                    else:
+                        log("update check: " + (
+                            f"update available ({info['count']} commits)"
+                            if info.get("available") else "up to date"))
+                        self.set_update_info(info)
+                    time.sleep(interval)
+            except Exception as ex:
+                log(f"update checker stopped: {ex}")
+
+        threading.Thread(target=_loop, daemon=True).start()
+        log(f"update checker started (first={first_delay}s, interval={interval}s)")
 
     # ---------- 窗口行为: WndProc 子类化 (边缘缩放) ----------
 
@@ -1627,6 +2401,1524 @@ class TitleBar:
                 f"new={wv_new:#x} setlwpret={wv_old:#x}")
         except Exception as ex:
             log(f"webview wndproc subclass failed: {ex}")
+
+
+# ==================== 升级检测与版本更新 ====================
+# 需求: 窗体标题栏最小化按钮左侧显示"有新版本"蓝色提示 (蓝色文字 + 蓝色
+# 下划线, 无背景色); 点击弹出更新日志 (官方 master 新提交列表, 即更新日志)
+# 与版本选择 (最新版 / 指定提交), 确认后 git fetch + checkout 切换版本,
+# 并让下次启动自动重新构建 (删除构建指纹标记)。
+#
+# 网络: 直连 GitHub 可能失败 (尤其代理环境), 自动读取 Windows 系统代理
+# (HKCU Internet Settings) 作为 git http.proxy 重试; 也可用环境变量
+# DSH_GIT_PROXY 显式指定代理 (http://host:port)。
+#
+# 测试钩子 (不影响正常运行):
+#   DSH_DEMO_UPDATE=1          模拟"有更新"数据与模拟升级 (不访问网络, 不碰仓库)
+#   DSH_DEMO_UPDATE_AUTOOPEN=1 演示模式下自动弹出升级对话框 (验证 UI 用)
+#   DSH_UPDATE_FIRST_DELAY / DSH_UPDATE_INTERVAL  首次检测延迟/检测间隔 (秒)
+
+def _no_window_startup() -> tuple[int, object | None]:
+    """subprocess 无窗口启动参数 (Windows)。"""
+    if os.name != "nt":
+        return 0, None
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return subprocess.CREATE_NO_WINDOW, si
+
+
+def _read_system_proxy() -> str | None:
+    """读取 Windows 系统代理 (HKCU .../Internet Settings), 返回 http://host:port
+    或 None。仅提取 http 协议条目 (https 条目同 host, http 够用)。"""
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        try:
+            enable, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+        finally:
+            winreg.CloseKey(key)
+    except OSError:
+        return None
+    if not enable or not server:
+        return None
+    server = server.strip()
+    if not server:
+        return None
+    if "=" in server:  # 分协议列表: http=host:port;https=host:port
+        for part in server.split(";"):
+            name, _, host = part.partition("=")
+            if name.strip().lower() == "http" and host.strip():
+                server = host.strip()
+                break
+        else:
+            return None
+    if "://" not in server:
+        server = "http://" + server
+    return server
+
+
+def _git_proxy_candidates() -> list[str]:
+    """候选代理列表: 环境变量 DSH_GIT_PROXY 优先, 其次系统代理。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in (os.environ.get("DSH_GIT_PROXY", "").strip(),
+              _read_system_proxy() or ""):
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+_GIT_PROXY = {"value": None}  # None=未探测  ""=直连可用  "url"=该代理可用
+
+# 包内便携 git (MinGit): release 包自带, 接收方无需安装 git 也能
+# 拉取仓库 / 切换版本。MinGit zip 解压后根目录直接是 cmd\git.exe 等,
+# 打包时放在 DSH_Desktop\portable\git\ 下。源码/开发模式没有该目录,
+# 回退使用系统 git。
+PORTABLE_GIT = BUILD_DIR / "portable" / "git" / "cmd" / "git.exe"
+
+_GIT_BIN: str | None = None
+
+
+def _system_git_available() -> bool:
+    """检测系统 PATH 里是否有可用的 git (用户自己安装了 git)。"""
+    try:
+        import shutil
+        return shutil.which("git") is not None
+    except Exception:
+        return False
+
+
+def _git_bin() -> str:
+    """解析 git 可执行文件: 优先系统 git (用户已安装时直接用其 git),
+    否则用包内便携 MinGit。
+
+    首次调用探测并缓存 (启动后不会中途更换)。"""
+    global _GIT_BIN
+    if _GIT_BIN is None:
+        if _system_git_available():
+            _GIT_BIN = "git"
+            log("using system git (user installed)")
+        elif PORTABLE_GIT.is_file():
+            _GIT_BIN = str(PORTABLE_GIT)
+            log(f"using bundled git: {_GIT_BIN}")
+        else:
+            _GIT_BIN = "git"
+            log("no git found (system or bundled), git commands will fail")
+    return _GIT_BIN
+
+
+_NODE_BIN: str | None = None
+
+
+def _node_bin() -> str:
+    """解析 node 可执行文件: 优先包内便携 node, 否则系统 node。
+
+    首次调用探测并缓存。"""
+    global _NODE_BIN
+    if _NODE_BIN is None:
+        if PORTABLE_NODE.is_file():
+            _NODE_BIN = str(PORTABLE_NODE)
+            log(f"using bundled node: {_NODE_BIN}")
+        else:
+            _NODE_BIN = "node"
+            log("bundled node not found, falling back to system node")
+    return _NODE_BIN
+
+
+def _node_env() -> dict:
+    """子进程环境: 便携 node 时把其目录 prepend 到 PATH。
+
+    后端/构建脚本内部会 spawn node/pnpm 子命令, 需要 node 在 PATH 里
+    (否则只装了内嵌 node、没装系统 node 的机器上子命令找不到 node)。"""
+    env = os.environ.copy()
+    node_bin = _node_bin()
+    node_dir = str(Path(node_bin).resolve().parent) if os.path.isabs(node_bin) else ""
+    if node_dir:
+        path_key = next((k for k in env if k.lower() == "path"), "PATH")
+        env[path_key] = node_dir + os.pathsep + env.get(path_key, "")
+    return env
+
+
+_PNPM_BIN: str | None = None
+
+
+def _pnpm_bin() -> str:
+    """解析 pnpm: 便携 pnpm.exe > 仓库 node_modules 里的 pnpm.cjs > 系统 pnpm。
+
+    首次调用探测并缓存。"""
+    global _PNPM_BIN
+    if _PNPM_BIN is None:
+        if PORTABLE_PNPM.is_file():
+            _PNPM_BIN = str(PORTABLE_PNPM)
+            log(f"using bundled pnpm: {_PNPM_BIN}")
+        elif (SOURCE / "node_modules" / "pnpm" / "bin" / "pnpm.cjs").is_file():
+            _PNPM_BIN = str(SOURCE / "node_modules" / "pnpm" / "bin" / "pnpm.cjs")
+            log(f"using repo pnpm: {_PNPM_BIN}")
+        else:
+            _PNPM_BIN = "pnpm"
+            log("bundled pnpm not found, falling back to system pnpm")
+    return _PNPM_BIN
+
+
+def _pnpm_cmd(action: str) -> str:
+    """返回可直接执行的 pnpm 命令串 (带引号): pnpm.exe 直接跑;
+    .cjs 用 node 跑 (pnpm.cjs 需要 node 运行时); 系统 pnpm 直接调。
+    仅用于弹控制台窗口的构建命令; 静默子进程请用 _pnpm_list
+    (cmd /S /c 的嵌套引号会把参数里带引号的值解析坏, 如
+    --store-dir "path with spaces" 的结尾引号会传给 pnpm)。"""
+    bin_ = _pnpm_bin()
+    if bin_ == "pnpm":
+        return f"pnpm {action}"
+    if bin_.lower().endswith(".cjs"):
+        return f'"{_node_bin()}" "{bin_}" {action}'
+    return f'"{bin_}" {action}'
+
+
+def _pnpm_list(action: list[str]) -> list[str]:
+    """返回 pnpm 命令 (list 形式, 无 cmd 引号问题): pnpm.exe 直接跑;
+    .cjs 用 node 跑; 系统 pnpm 直接调。"""
+    bin_ = _pnpm_bin()
+    if bin_ == "pnpm":
+        return ["pnpm"] + action
+    if bin_.lower().endswith(".cjs"):
+        return [_node_bin(), bin_] + action
+    return [bin_] + action
+
+
+def _start_cmd() -> list[str]:
+    """启动后端的命令: node apps/cli/lib/bin.js web (node 用解析后的路径)。"""
+    return [_node_bin(), "apps/cli/lib/bin.js", "web"]
+
+
+def _build_cmd() -> str:
+    """重建后端的命令 (完整命令行字符串): cmd /S /c "node <pnpm> run build ..."。
+
+    弹独立控制台, 失败暂停。必须返回字符串并由 subprocess 以字符串模式
+    执行 (CreateProcess 原样传命令行): 列表模式会被 list2cmdline 把内部
+    引号转义成 \\", cmd 不认, 含空格的路径会解析失败。"""
+    return ('cmd /S /c "'
+            + _pnpm_cmd("run build")
+            + ' && exit 0 || (echo. & echo [BUILD FAILED] 构建失败, 请查看上方错误信息. & pause)"')
+
+
+def _git(args: list[str], timeout: float = 180.0) -> tuple[int, str, str]:
+    """在仓库内运行 git (cwd=SOURCE), 带系统代理回退 + 内嵌 git 回退。
+
+    候选顺序: 系统 git (用户已安装) 优先; 失败 (网络/启动/自身配置) 自动
+    回退包内便携 MinGit 重试; 仍失败返回最后一次结果。
+    返回 (returncode, stdout, stderr); 超时/无法启动返回 returncode=-1。
+    首次调用探测直连与各代理 (系统代理每次实时从注册表读取), 成功后缓存;
+    缓存命中但失败 (如代理端口变了/代理关闭) 时清除缓存并重新探测。"""
+    flags, si = _no_window_startup()
+
+    def _run(bin_: str, proxy: str | None):
+        cmd = [bin_, "-C", str(SOURCE)]
+        if proxy:
+            cmd += ["-c", "http.proxy=" + proxy]
+        try:
+            # git 输出可能是 UTF-8 (中文提交信息等), 显式按 UTF-8 解码,
+            # 避免系统默认 GBK 解码崩溃导致 stdout 变空 (列表为空/只有一个 commit)
+            r = subprocess.run(cmd + list(args), capture_output=True, text=True,
+                               encoding="utf-8", errors="replace",
+                               timeout=timeout, creationflags=flags, startupinfo=si)
+            return r.returncode, r.stdout, r.stderr
+        except subprocess.TimeoutExpired:
+            return -1, "", f"git 超时 ({timeout:.0f}s): {' '.join(args)}"
+        except OSError as ex:
+            return -1, "", f"git 启动失败: {ex}"
+
+    # 候选 git: 系统 git 优先, 内嵌 MinGit 兜底 (去重)
+    candidates: list[str] = []
+    if _system_git_available():
+        candidates.append("git")
+    if PORTABLE_GIT.is_file():
+        candidates.append(str(PORTABLE_GIT))
+    if not candidates:
+        candidates = ["git"]
+
+    last: tuple[int, str, str] | None = None
+    for idx, bin_ in enumerate(candidates):
+        cached = _GIT_PROXY["value"]
+        if cached is not None:
+            r = _run(bin_, cached or None)
+            if r[0] == 0:
+                return r
+            # 缓存失效 (代理端口变了/代理关了): 清缓存, 走完整重新探测
+            log(f"git cached proxy '{cached}' failed, re-probing (system proxy may have changed)")
+            _GIT_PROXY["value"] = None
+        last = None
+        for p in [None] + list(_git_proxy_candidates()):
+            r = _run(bin_, p)
+            if r[0] == 0:
+                _GIT_PROXY["value"] = p or ""
+                return r
+            last = r
+        if last is not None and last[0] == 0:
+            return last
+        if idx < len(candidates) - 1:
+            log("system git failed (network/config), falling back to bundled MinGit")
+    return last if last is not None else (-1, "", "git unavailable")
+
+
+def _read_update_seen() -> str:
+    """读取升级通知"已读"标记 (已查看过的最新提交哈希), 无则空串。
+
+    用途: 红点显隐判断 (点击升级按钮后记录, 重启后仍记住)。"""
+    try:
+        if SEEN_MARKER.exists():
+            return SEEN_MARKER.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _demo_update_info(seed: str) -> dict:
+    """测试/演示用假更新数据 (不访问网络, 不修改仓库)。
+
+    用途: 不联网即可验证标题栏升级按钮、红点、更新日志列表与版本选择 UI。
+    seed 为数字时作为模拟新提交数量 (1..20), 否则默认 3 条。"""
+    n = 3
+    try:
+        n = max(1, min(20, int(seed)))
+    except ValueError:
+        pass
+    commits = []
+    for i in range(n):
+        commits.append({
+            "hash": "d5em0" + f"{i:035d}",
+            "short": "demo%02d" % i,
+            "date": "2026-01-%02d %02d:%02d:%02d" % (
+                i + 1, (i + 8) % 24, (i * 7) % 60, (i * 11) % 60),
+            "subject": f"模拟提交 {i + 1}: 演示用更新日志条目 (DSH_DEMO_UPDATE)",
+        })
+    return {
+        "available": True, "count": n, "demo": True,
+        "head": "47f943859bef60e4160492346772ded9b24f765a",
+        "head_short": "47f9438",
+        "latest": "d" * 40, "latest_short": "d" * 7,
+        "commits": commits,
+    }
+
+
+def _fetch_origin() -> tuple[int, str, str]:
+    """拉取官方 master 到 origin/master: 默认走 origin remote (clone 时是 SSH),
+    SSH 失败 (未配 key / 认证失败 / 网络) 时回退 HTTPS URL 拉取。"""
+    r = _git(["fetch", "origin", "master", "--no-tags"], timeout=180)
+    if r[0] == 0:
+        return r
+    log("fetch via origin failed, falling back to https url: " + r[2].strip()[:200])
+    return _git(["fetch", REPO_URL_HTTPS,
+                 "master:refs/remotes/origin/master", "--no-tags"], timeout=180)
+
+
+def check_for_update() -> dict | None:
+    """检测官方仓库 (origin/master) 相对当前 HEAD 的新提交。
+
+    成功返回信息字典 (available=False 也表示检测成功, 只是无更新);
+    网络/仓库异常返回 None (调用方保持现状, 不因检测失败隐藏已有提示)。"""
+    demo = os.environ.get("DSH_DEMO_UPDATE", "").strip()
+    if demo:
+        log("update check: DEMO mode (DSH_DEMO_UPDATE)")
+        return _demo_update_info(demo)
+    r = _fetch_origin()
+    if r[0] != 0:
+        log(f"update check: fetch failed: {r[2].strip()[:300]}")
+        return None
+    head_r = _git(["rev-parse", "HEAD"])
+    if head_r[0] != 0:
+        log("update check: cannot resolve HEAD")
+        return None
+    count_r = _git(["rev-list", "--count", "HEAD..origin/master"])
+    if count_r[0] != 0:
+        log("update check: cannot count commits")
+        return None
+    try:
+        count = int(count_r[1].strip() or "0")
+    except ValueError:
+        return None
+    latest_r = _git(["rev-parse", "origin/master"])
+    head = head_r[1].strip()
+    latest = latest_r[1].strip() if latest_r[0] == 0 else ""
+    info = {"available": count > 0, "count": count, "demo": False,
+            "head": head, "head_short": head[:7],
+            "latest": latest, "latest_short": latest[:7],
+            "commits": []}
+    if count > 0:
+        log_r = _git(["log", "HEAD..origin/master",
+                      "--format=%H%x09%ad%x09%s", _GIT_DATE_FMT])
+        if log_r[0] == 0 and log_r[1]:
+            for line in log_r[1].splitlines():
+                parts = line.split("\t", 2)
+                if len(parts) == 3:
+                    h, d, subj = parts
+                    info["commits"].append(
+                        {"hash": h, "short": h[:7], "date": d, "subject": subj})
+        log(f"update check: {count} new commits on origin/master")
+    else:
+        log("update check: up to date")
+    return info
+
+
+def perform_update(target_ref: str, progress=None, demo: bool = False) -> tuple[bool, str]:
+    """把仓库强制切换到 target_ref (本地已存在的 commit/ref)。
+
+    纯本地操作, 不访问网络: 切换 = git checkout -f (强制, 丢弃工作区所有
+    未提交改动), 切换后处于 detached HEAD。远程拉取 (fetch) 由后台更新
+    检测线程 / 对话框"获取最新仓库"按钮负责, 切换只针对本地已有提交。
+    流程: 校验目标本地存在 -> checkout -f -> 记录 last-commit.txt ->
+    删除构建指纹标记 (调用方随后立即重新构建, 删指纹作失败兜底) ->
+    pnpm install (尽力而为)。
+    返回 (ok, message)。progress(msg) 可选回调 (后台线程调用, 调用方负责封送)。"""
+    def _say(m: str) -> None:
+        if progress:
+            try:
+                progress(m)
+            except Exception:
+                pass
+        log("update: " + m)
+
+    if demo:
+        _say("演示模式: 模拟升级过程…")
+        time.sleep(1.5)
+        _say("演示完成 (未实际修改代码)")
+        return True, "演示模式: 已完成, 未修改任何代码。"
+
+    # 校验目标在本地存在 (列表里的 commit 都来自本地仓库; 防止
+    # origin/master 从未拉取成功时 checkout 直接失败)
+    verify = _git(["rev-parse", "--verify", "--quiet", target_ref + "^{commit}"],
+                  timeout=30)
+    if verify[0] != 0:
+        return False, ("本地没有目标提交 " + target_ref[:12]
+                       + "，请先点击\"获取最新仓库\"拉取后再切换。")
+    _say(f"切换版本到 {target_ref[:12]} …")
+    # 强制切换: 丢弃工作区所有未提交改动, 切换后为 detached HEAD
+    r = _git(["checkout", "-q", "-f", target_ref], timeout=300)
+    if r[0] != 0:
+        return False, ("切换版本失败: " + (r[2].strip() or "未知错误")[:400]
+                       + "\n\n强制切换会丢弃工作区未提交的改动。")
+    new_r = _git(["rev-parse", "HEAD"])
+    new_head = new_r[1].strip() if new_r[0] == 0 else "?"
+    # 记录当前提交 (与 DSH_Desktop/last-commit.txt 的既有约定一致)
+    try:
+        (BUILD_DIR / "last-commit.txt").write_text(new_head + "\n", encoding="utf-8")
+    except OSError as ex:
+        log(f"update: last-commit write failed: {ex}")
+    # 使构建指纹失效: 调用方随后立即重新构建; 若构建失败, 下次启动
+    # 检测到指纹缺失会自动重试构建 (兜底)
+    try:
+        if MARKER.exists():
+            MARKER.unlink()
+            log("update: build fingerprint invalidated (rebuild follows)")
+    except OSError as ex:
+        log(f"update: fingerprint invalidate failed: {ex}")
+    _say("安装依赖 (pnpm install) …")
+    # list 模式: cmd /S /c 嵌套引号会把含空格路径解析坏
+    pi = hidden_run(_pnpm_list(["install", "--config.confirmModulesPurge=false"]),
+                    input="y\n",
+                    cwd=str(SOURCE), env=_node_env(),
+                    capture_output=True, text=True, timeout=900)
+    if pi.returncode != 0:
+        log("update: pnpm install failed: " + ((pi.stderr or "")[-400:]))
+        msg = (f"已切换到 {new_head[:12]}（强制切换，工作区改动已丢弃）。"
+               "依赖安装未完成 (pnpm install 失败), 重新构建可能失败。")
+    else:
+        msg = (f"已切换到 {new_head[:12]}（强制切换，工作区改动已丢弃）。"
+               "正在重新构建后端…")
+    _say("完成")
+    return True, msg
+
+
+def _wait_backend_ready(timeout: float | None = None) -> bool:
+    """轮询 http://127.0.0.1:PORT 直到就绪 (默认 WAIT_TIMEOUT 秒)。"""
+    deadline = time.time() + (timeout if timeout is not None else WAIT_TIMEOUT)
+    while time.time() < deadline:
+        if http_ready():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _restart_backend_blocking(timeout: float | None = None) -> bool:
+    """杀旧后端进程树 -> 启动新后端 (纳入 Job) -> 等待就绪。
+
+    用于切换版本重新构建后加载新产物。返回是否就绪; 端口被非 DSH
+    进程占用时只等待就绪 (不杀)。"""
+    global _JOB_HANDLE
+    proc = _ACTIVE.get("proc")
+    if proc is not None and proc.poll() is None:
+        log(f"restart backend: killing old backend pid={proc.pid}")
+        kill_tree(proc.pid)
+        _ACTIVE["proc"] = None
+    # 等端口释放 (kill_tree 异步, 轮询)
+    for _ in range(40):
+        if not port_open("127.0.0.1", PORT):
+            break
+        time.sleep(0.25)
+    if port_open("127.0.0.1", PORT):
+        log("restart backend: port still occupied (not ours?), reusing")
+        return _wait_backend_ready(timeout)
+    log("restart backend: starting new backend")
+    p = start_backend()
+    if p is not None and _JOB_HANDLE is not None:
+        _assign_pid_to_job(_JOB_HANDLE, p.pid)
+    return _wait_backend_ready(timeout)
+
+
+def _reload_webview() -> None:
+    """重新加载主窗口页面 (重建后端后重开画面)。"""
+    w = _MAIN_WINDOW
+    if w is None:
+        return
+    try:
+        w.load_url(URL)
+        log("webview reloaded (load_url)")
+    except Exception as ex:
+        log(f"webview load_url failed: {ex}")
+        try:
+            w.evaluate_js("location.reload()")
+            log("webview reloaded (location.reload)")
+        except Exception as ex2:
+            log(f"webview reload failed: {ex2}")
+
+
+def _start_rebuild_after_switch(titlebar) -> None:
+    """切换版本成功后立即执行: 重新构建后端 -> 重启后端 -> 重开画面。
+
+    后台线程执行; 期间主界面保持"版本切换中…"覆盖层, 页面刷新后自动
+    消失 (新页面没有覆盖层 div)。构建失败: 提示用户 (代码已切换,
+    下次启动会自动重试构建, 当前仍用旧后端)。"""
+    def _ui(fn) -> None:
+        # 封送到主窗口 UI 线程 (titlebar.form 是主窗口, 升级对话框已关闭)
+        try:
+            from System import Action
+            titlebar.form.Invoke(Action(fn))
+        except Exception:
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def _finish_ui(alert: str | None) -> None:
+        def _do() -> None:
+            try:
+                hide = getattr(titlebar, "_hide_updating_overlay", None)
+                if hide is not None:
+                    hide()
+            except Exception:
+                pass
+            if alert:
+                try:
+                    from System.Windows.Forms import (
+                        MessageBox, MessageBoxButtons, MessageBoxIcon)
+                    MessageBox.Show(titlebar.form, alert, "重新构建",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                except Exception:
+                    pass
+        _ui(_do)
+
+    def _work() -> None:
+        try:
+            log("rebuild after switch: pnpm build start")
+            if not run_build():
+                log("rebuild after switch: build failed")
+                _finish_ui("重新构建后端失败。代码已切换，下次启动应用时会自动重试构建。")
+                return
+            fp = get_workspace_fingerprint()
+            if fp:
+                record_fingerprint(fp)
+                log("rebuild after switch: fingerprint recorded")
+            log("rebuild after switch: restarting backend")
+            if not _restart_backend_blocking():
+                log("rebuild after switch: backend not ready in time")
+                _finish_ui(f"后端重启超时（超过 {WAIT_TIMEOUT} 秒未就绪）。请重启应用。")
+                return
+            log("rebuild after switch: reloading webview")
+            _ui(_reload_webview)
+            log("rebuild after switch: done")
+        except Exception as ex:
+            log(f"rebuild after switch failed: {ex}")
+            _finish_ui(f"切换后重建流程出错: {ex}")
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
+def _restart_application() -> None:
+    """延迟 3 秒重启 exe (等本进程退出、释放单实例 Mutex 后再启动新实例)。
+
+    用独立的 powershell 进程做延迟启动 (本进程退出后它仍存活)。
+    注: 版本切换已改为切换后自动重建重开画面 (_start_rebuild_after_switch),
+    本函数当前无调用者, 保留备用 (如构建失败后提供"立即重启"选项)。"""
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable)
+    else:
+        exe = BASE / "DSH_Desktop.exe"
+    if not exe.is_file():
+        log(f"restart: exe not found at {exe}")
+        return
+    ps = ("Start-Sleep -Seconds 3; "
+          "Start-Process -FilePath '" + str(exe).replace("'", "''") + "'")
+    try:
+        flags, si = _no_window_startup()
+        subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive",
+                          "-WindowStyle", "Hidden", "-Command", ps],
+                         creationflags=flags, startupinfo=si)
+        log(f"restart scheduled: {exe}")
+    except Exception as ex:
+        log(f"restart spawn failed: {ex}")
+
+
+# ==================== 启动加载窗 (splash) ====================
+# 覆盖"构建后端 / 启动后端 / 等待就绪"阶段: 中间 deepseek娘.png,
+# 下方蓝色 marquee 进度条。主题色与主窗口同一套方案 (CSS token + 偏好)。
+_SPLASH = {"form": None, "bar": None, "bar_state": None, "lbl": None}
+
+# 启动流程取消状态: 用户点击 splash 关闭按钮时置位, 终止进行中的
+# clone/install/build 子进程并让 main() 尽快退出。
+_ACTIVE = {"proc": None, "cancel": False}
+
+
+def _splash_theme():
+    """与主窗口一致的 (dark, bg_rgb, fg_rgb, track_rgb) 配色。"""
+    tokens = read_theme_tokens()
+    dark = resolve_initial_dark()
+    if tokens:
+        bg_rgb = tokens[0] if dark else tokens[1]
+    else:
+        bg_rgb = (21, 21, 23) if dark else (249, 250, 251)
+    fg_rgb = (229, 231, 235) if dark else (31, 41, 55)
+    track_rgb = (47, 47, 50) if dark else (226, 230, 236)
+    return dark, bg_rgb, fg_rgb, track_rgb
+
+
+def _splash_paint_bar(sender, e, state, blue) -> None:
+    """自绘蓝色圆角进度条 (按 state["pct"] 0..100 填充), 颜色固定 #2563EB。"""
+    try:
+        from System.Drawing import SolidBrush
+        from System.Drawing.Drawing2D import (GraphicsPath, SmoothingMode)
+        w = sender.ClientSize.Width
+        h = sender.ClientSize.Height
+        pct = max(0.0, min(100.0, float(state["pct"])))
+        bw = w * pct / 100.0
+        if bw <= 0:
+            return
+        g = e.Graphics
+        g.SmoothingMode = SmoothingMode.AntiAlias
+        d = float(h)
+        if bw < d:
+            bw = d  # 极小进度时仍显示一个最小圆角块
+        path = GraphicsPath()
+        path.AddArc(0, 0, d, d, 180, 90)
+        path.AddArc(bw - d, 0, d, d, 270, 90)
+        path.AddArc(bw - d, h - d, d, d, 0, 90)
+        path.AddArc(0, h - d, d, d, 90, 90)
+        path.CloseFigure()
+        g.FillPath(SolidBrush(blue), path)
+    except Exception as ex:
+        log(f"splash bar paint failed: {ex}")
+
+
+def _splash_run() -> None:
+    """加载窗线程入口 (独立消息循环); 主窗口显示后由 _close_splash 关闭。"""
+    try:
+        import clr  # noqa: F401  初始化 pythonnet (主流程在 import webview 时才加载, 这里提前)
+        clr.AddReference("System.Windows.Forms")
+        clr.AddReference("System.Drawing")
+        from System import Enum as _Enum
+        from System.Windows.Forms import (Form, PictureBox, Label, Panel,
+                                          FormBorderStyle, Application)
+        from System.Drawing import (Color, Size, Image, Font, ContentAlignment, Icon)
+        dark, bg_rgb, fg_rgb, track_rgb = _splash_theme()
+        png = WINDOW_DIR / "deepseek娘.png"
+        BLUE = Color.FromArgb(37, 99, 235)  # WebUI 主按钮蓝 #2563EB
+
+        form = Form()
+        form.Text = "DSH Desktop"
+        form.FormBorderStyle = FormBorderStyle(0)  # None
+        # pythonnet 3.x: StartPosition 枚举无法直接 import, 用 Enum.ToObject 构造
+        form.StartPosition = _Enum.ToObject(form.StartPosition.GetType(), 1)  # CenterScreen
+        form.ShowInTaskbar = True
+        # 任务栏图标: 用应用图标, 避免任务栏空白/默认图标
+        try:
+            ico = WINDOW_DIR / "deepseek娘.ico"
+            if ico.is_file():
+                form.Icon = Icon(str(ico))
+        except Exception:
+            pass
+        # 不用 TopMost (置顶会一直挡其他窗口): 改为显示时激活到前台
+        # (与主窗口 _activate_foreground 同一手法), 一瞬间跑到最前面
+        # 但不带置顶属性, 之后其他窗口可正常盖住它。
+        def _splash_activate(sender, e) -> None:
+            try:
+                hwnd = form.Handle.ToInt32()
+                u = ctypes.windll.user32
+                # 模拟 ALT 键解除前台锁限制 (标准绕过手法, 同主窗口)
+                u.keybd_event(0x12, 0, 0, 0)
+                u.keybd_event(0x12, 0, 2, 0)
+                u.ShowWindow(hwnd, 9)  # SW_RESTORE
+                u.SetForegroundWindow(hwnd)
+                u.BringWindowToTop(hwnd)
+                u.SetActiveWindow(hwnd)
+            except Exception:
+                pass
+
+        form.Shown += _splash_activate
+        try:
+            form.Font = Font("Microsoft YaHei UI", 9.5)
+        except Exception:
+            pass
+        form.ClientSize = Size(460, 560)
+        form.BackColor = Color.FromArgb(bg_rgb[0], bg_rgb[1], bg_rgb[2])
+
+        # DWM 圆角 + 边框色 = 背景色 (与主窗口/升级对话框一致)
+        def _dwm(sender, e) -> None:
+            try:
+                hwnd = form.Handle.ToInt32()
+                dwm = ctypes.WinDLL("dwmapi")
+                dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+                dwm.DwmSetWindowAttribute.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_int]
+                col = ctypes.c_int((bg_rgb[2] << 16) | (bg_rgb[1] << 8) | bg_rgb[0])
+                dwm.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(col), 4)
+                corner = ctypes.c_int(2)  # DWMWA_WINDOW_CORNER_PREFERENCE = ROUND
+                dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner), 4)
+            except Exception:
+                pass
+        form.Shown += _dwm
+
+        # 右上角关闭按钮: 与主窗口标题栏一致的样式 (hover 红底 + 白色 ×)
+        from System.Drawing import Pen as _Pen, SolidBrush as _SolidBrush
+        from System.Windows.Forms import Cursors as _Cursors
+        from System.Drawing.Drawing2D import SmoothingMode as _Smoothing
+        close_state = {"hover": False, "pressed": False}
+        close_btn = Panel()
+        close_btn.SetBounds(460 - 44, 0, 44, 40)
+        close_btn.BackColor = form.BackColor
+
+        def _paint_close(s, e) -> None:
+            try:
+                g = e.Graphics
+                rw, rh = 44, 40
+                if close_state["pressed"]:
+                    col = (196, 52, 52)
+                elif close_state["hover"]:
+                    col = (239, 68, 68)
+                else:
+                    col = None
+                if col is not None:
+                    g.FillRectangle(_SolidBrush(Color.FromArgb(col[0], col[1], col[2])),
+                                    0, 0, rw, rh)
+                x_rgb = ((229, 231, 235) if (close_state["hover"] or close_state["pressed"])
+                         else (148, 163, 184))
+                pen = _Pen(Color.FromArgb(x_rgb[0], x_rgb[1], x_rgb[2]), 2.0)
+                g.SmoothingMode = _Smoothing.AntiAlias
+                cx, cy = rw / 2.0, rh / 2.0
+                g.DrawLine(pen, cx - 7, cy - 7, cx + 7, cy + 7)
+                g.DrawLine(pen, cx + 7, cy - 7, cx - 7, cy + 7)
+                pen.Dispose()
+            except Exception:
+                pass
+
+        close_btn.Paint += _paint_close
+        close_btn.MouseEnter += lambda s, e: (close_state.update(hover=True), close_btn.Invalidate())
+        close_btn.MouseLeave += lambda s, e: (close_state.update(hover=False, pressed=False), close_btn.Invalidate())
+        close_btn.MouseDown += lambda s, e: (close_state.update(pressed=True), close_btn.Invalidate())
+        close_btn.MouseUp += lambda s, e: (close_state.update(pressed=False), close_btn.Invalidate())
+        close_btn.Click += lambda s, e: _cancel_startup()
+        try:
+            close_btn.Cursor = _Cursors.Hand
+        except Exception:
+            pass
+        form.Controls.Add(close_btn)
+
+        # 中间图片: 1:1 原图居中显示 (256x256), 不放大避免发糊
+        pic = PictureBox()
+        pic.SetBounds(102, 70, 256, 256)
+        pic.SizeMode = _Enum.ToObject(pic.SizeMode.GetType(), 3)  # CenterImage (原尺寸)
+        pic.BackColor = form.BackColor
+        if png.is_file():
+            try:
+                pic.Image = Image.FromFile(str(png))
+            except Exception as ex:
+                log(f"splash png load failed: {ex}")
+        form.Controls.Add(pic)
+
+        # 蓝色进度条 (自绘, 按阶段推进的确定进度)
+        bar = Panel()
+        bar.SetBounds(100, 400, 260, 8)
+        bar.BackColor = Color.FromArgb(track_rgb[0], track_rgb[1], track_rgb[2])
+        # 双缓冲: 每次 Invalidate 触发全量自绘, 无双缓冲会明显闪烁
+        try:
+            from System.Windows.Forms import ControlStyles as _CS
+            bar.SetStyle(_CS.OptimizedDoubleBuffer | _CS.AllPaintingInWmPaint
+                         | _CS.UserPaint, True)
+        except Exception:
+            pass
+        bar_state = {"pct": 0.0}
+        bar.Paint += lambda s, e: _splash_paint_bar(s, e, bar_state, BLUE)
+        form.Controls.Add(bar)
+
+        # 底部文字
+        lbl = Label()
+        lbl.SetBounds(0, 430, 460, 40)
+        lbl.Text = "正在启动 DSH Desktop…"
+        lbl.TextAlign = ContentAlignment.MiddleCenter
+        lbl.BackColor = form.BackColor
+        lbl.ForeColor = Color.FromArgb(fg_rgb[0], fg_rgb[1], fg_rgb[2])
+        form.Controls.Add(lbl)
+
+        # 无边框窗体拖动: 任意位置按下左键 -> ReleaseCapture +
+        # WM_NCLBUTTONDOWN/HTCAPTION 让系统接管拖动循环 (与主窗口标题栏
+        # 同一手法)。关闭按钮除外 (保留其点击 = 取消启动)。
+        from System.Windows.Forms import MouseButtons as _MouseButtons
+
+        def _drag_start(s, e) -> None:
+            try:
+                if e.Button == _MouseButtons.Left:
+                    hwnd = form.Handle.ToInt32()
+                    u = ctypes.windll.user32
+                    u.ReleaseCapture()
+                    u.SendMessageW(wintypes.HWND(hwnd), 0x00A1, 2, 0)
+            except Exception:
+                pass
+
+        form.MouseDown += _drag_start
+        pic.MouseDown += _drag_start
+        bar.MouseDown += _drag_start
+        lbl.MouseDown += _drag_start
+
+        _SPLASH["form"] = form
+        _SPLASH["bar"] = bar
+        _SPLASH["bar_state"] = bar_state
+        _SPLASH["lbl"] = lbl
+        Application.Run(form)
+    except Exception as ex:
+        log(f"splash thread failed: {ex}")
+    finally:
+        _SPLASH["form"] = None
+
+
+def _splash_apply_progress(form, pct: float, text: str | None) -> None:
+    """splash 线程内 (Invoke 封送): 更新进度条百分比与状态文字。"""
+    try:
+        bar = _SPLASH.get("bar")
+        bar_state = _SPLASH.get("bar_state")
+        if bar is not None and bar_state is not None:
+            bar_state["pct"] = max(0.0, min(100.0, float(pct)))
+            bar.Invalidate()
+        if text is not None:
+            lbl = _SPLASH.get("lbl")
+            if lbl is not None:
+                lbl.Text = text
+    except Exception:
+        pass
+
+
+def _splash_set_progress(pct: float, text: str | None = None) -> None:
+    """主线程调用: 按启动阶段推进 splash 进度 (跨线程封送到 splash 线程)。"""
+    form = _SPLASH.get("form")
+    if form is None:
+        return
+    try:
+        from System import Action
+        form.Invoke(Action(lambda: _splash_apply_progress(form, pct, text)))
+    except Exception:
+        pass
+
+
+def _show_fatal(title: str, msg: str) -> None:
+    """启动关键步骤失败时的错误弹窗 (main 阶段, clr 可能尚未加载)。"""
+    try:
+        import clr  # noqa: F401
+        clr.AddReference("System.Windows.Forms")
+        from System.Windows.Forms import (MessageBox, MessageBoxButtons,
+                                          MessageBoxIcon)
+        MessageBox.Show(msg, title, MessageBoxButtons.OK, MessageBoxIcon.Warning)
+    except Exception as ex:
+        log(f"fatal dialog failed: {ex}")
+
+
+def _start_splash() -> None:
+    """启动加载窗 (独立线程, daemon): 构建/后端启动/等待就绪期间显示。"""
+    try:
+        threading.Thread(target=_splash_run, daemon=True, name="splash").start()
+        # 等待 splash form 就绪: 否则紧随其后的 _splash_set_progress
+        # (首次安装时 clone/fetch 紧接 splash 启动) 会因 form 未创建被
+        # 直接丢弃, 表现为加载窗一直停在初始文字、进度条不动
+        for _ in range(200):
+            if _SPLASH.get("form") is not None:
+                time.sleep(0.2)  # 再等 Application.Run 进入消息循环
+                break
+            time.sleep(0.05)
+        log("splash started")
+    except Exception as ex:
+        log(f"splash start failed: {ex}")
+
+
+def _cancel_startup() -> None:
+    """用户点击 splash 关闭按钮: 取消启动流程, 终止进行中的子进程, 退出应用。"""
+    if _ACTIVE["cancel"]:
+        return
+    _ACTIVE["cancel"] = True
+    log("startup cancelled by user (splash close button)")
+    p = _ACTIVE.get("proc")
+    if p is not None and p.poll() is None:
+        try:
+            # 杀进程树并等待退出, 避免孤儿 git/ssh 进程残留文件锁
+            _kill_proc_tree(p)
+            log(f"cancelled active subprocess pid={p.pid}")
+        except Exception as ex:
+            log(f"cancel subprocess failed: {ex}")
+    _close_splash()
+
+
+def _close_splash() -> None:
+    """关闭加载窗 (主窗口显示后 / 任何退出路径调用; 幂等)。"""
+    form = _SPLASH.get("form")
+    if form is None:
+        return
+    try:
+        from System import Action
+        form.Invoke(Action(form.Close))
+    except Exception:
+        try:
+            form.Close()
+        except Exception:
+            pass
+    log("splash closed")
+
+
+def _install_dialog_chrome(form, title: str, dark: bool, scale: float,
+                           on_close) -> int:
+    """给无边框对话框安装自绘标题栏 (与主窗口风格一致)。
+
+    背景=主题色, 左侧应用图标+标题文字, 右侧关闭按钮 (hover 变红),
+    标题栏区域可拖动窗体 (ReleaseCapture + WM_NCLBUTTONDOWN/HTCAPTION)。
+    返回标题栏高度 (逻辑像素), 调用方需把内容控件整体下移该高度。"""
+    from System.Windows.Forms import Panel, Cursors
+    from System.Drawing import (Color, Font, Pen, SolidBrush, Image,
+                                FontStyle)
+    from System.Drawing.Drawing2D import SmoothingMode
+    from System.Drawing.Text import TextRenderingHint
+
+    s = max(1.0, float(scale))
+    tb_h = int(TITLEBAR_HEIGHT * s)  # 复用主窗口标题栏高度常量
+    bg = TITLEBAR_THEMES["dark" if dark else "light"]["bg"]
+    if dark:
+        fg = (229, 231, 235)
+        icon_rgb = (151, 157, 166)
+    else:
+        fg = (31, 41, 55)
+        icon_rgb = (97, 102, 107)
+    close_hover = (239, 68, 68)
+    close_active = (196, 52, 52)
+
+    panel = Panel()
+    panel.BackColor = Color.FromArgb(bg[0], bg[1], bg[2])
+    state = {"hover": False, "pressed": False, "icon": None}
+    # 左侧应用图标 (与主窗口同源 png, 缩小显示)
+    try:
+        png = WINDOW_DIR / "deepseek娘.png"
+        if png.is_file():
+            state["icon"] = Image.FromFile(str(png))
+    except Exception:
+        pass
+
+    def _close_rect():
+        w = panel.ClientSize.Width
+        bw = int(44 * s)
+        return (w - bw, 0, bw, tb_h)
+
+    def _font():
+        try:
+            return Font("Microsoft YaHei UI", 9.0, FontStyle.Regular)
+        except Exception:
+            return Font("Arial", 9.0)
+
+    def _paint(sender, e) -> None:
+        g = e.Graphics
+        g.Clear(panel.BackColor)
+        if state["icon"] is not None:
+            size = int(16 * s)
+            g.DrawImage(state["icon"], int(10 * s), (tb_h - size) // 2, size, size)
+            text_x = int(32 * s)
+        else:
+            text_x = int(12 * s)
+        font = _font()
+        try:
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit
+            brush = SolidBrush(Color.FromArgb(fg[0], fg[1], fg[2]))
+            try:
+                size = g.MeasureString(title, font)
+                g.DrawString(title, font, brush, text_x, (tb_h - size.Height) / 2.0)
+            finally:
+                brush.Dispose()
+        finally:
+            font.Dispose()
+        # 右侧关闭按钮
+        rx, ry, rw, rh = _close_rect()
+        if state["pressed"]:
+            col = close_active
+        elif state["hover"]:
+            col = close_hover
+        else:
+            col = None
+        if col is not None:
+            g.FillRectangle(SolidBrush(Color.FromArgb(col[0], col[1], col[2])),
+                            rx, ry, rw, rh)
+        x_rgb = (229, 231, 235) if (state["hover"] or state["pressed"]) else icon_rgb
+        pen = Pen(Color.FromArgb(x_rgb[0], x_rgb[1], x_rgb[2]), max(1.0, 1.3 * s))
+        g.SmoothingMode = SmoothingMode.AntiAlias
+        cx = rx + rw / 2.0
+        cy = ry + rh / 2.0
+        try:
+            g.DrawLine(pen, cx - 3.5 * s, cy - 3.5 * s, cx + 3.5 * s, cy + 3.5 * s)
+            g.DrawLine(pen, cx + 3.5 * s, cy - 3.5 * s, cx - 3.5 * s, cy + 3.5 * s)
+        finally:
+            pen.Dispose()
+
+    def _in_close(x: int, y: int) -> bool:
+        rx, ry, rw, rh = _close_rect()
+        return rx <= x < rx + rw and 0 <= y < rh
+
+    def _mm(sender, e) -> None:
+        hover = _in_close(e.X, e.Y)
+        if hover != state["hover"]:
+            state["hover"] = hover
+            panel.Invalidate()
+            try:
+                panel.Cursor = Cursors.Hand if hover else Cursors.Default
+            except Exception:
+                pass
+
+    def _ml(sender, e) -> None:
+        if state["hover"]:
+            state["hover"] = False
+            panel.Invalidate()
+
+    def _md(sender, e) -> None:
+        if _in_close(e.X, e.Y):
+            state["pressed"] = True
+            panel.Invalidate()
+            return
+        # 拖动对话框 (与主窗口一致)
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = form.Handle.ToInt32()
+            user32.ReleaseCapture()
+            user32.SendMessageW(hwnd, 0x00A1, 2, 0)  # WM_NCLBUTTONDOWN, HTCAPTION
+        except Exception as ex:
+            log(f"dialog drag failed: {ex}")
+
+    def _mu(sender, e) -> None:
+        was = state["pressed"]
+        state["pressed"] = False
+        panel.Invalidate()
+        if was and _in_close(e.X, e.Y):
+            try:
+                on_close()
+            except Exception as ex:
+                log(f"dialog close failed: {ex}")
+
+    panel.Paint += _paint
+    panel.MouseMove += _mm
+    panel.MouseLeave += _ml
+    panel.MouseDown += _md
+    panel.MouseUp += _mu
+
+    def _layout(_s=None, _e=None) -> None:
+        panel.SetBounds(0, 0, form.ClientSize.Width, tb_h)
+
+    form.Resize += _layout
+    _layout()
+    form.Controls.Add(panel)
+    return tb_h
+
+
+# 切换版本期间的覆盖层脚本: 全屏盖住 webview 内容区。
+# 背景/文字/图标颜色全部引用页面自身的 CSS 变量 (跟随当前主题, 不突变):
+#   dark  : bg=--dsw-static-neutral-bluish-950  fg=--dsw-static-neutral-bluish-00
+#   light : bg=--dsw-static-neutral-bluish-50   fg=--dsw-static-neutral-bluish-950
+#   主色蓝: --dsw-static-blue-500 (旋转图标)
+_UPDATING_OVERLAY_JS = """(() => {
+  const id = '__dsh_updating__';
+  if (document.getElementById(id)) return;
+  const dark = document.body.hasAttribute('data-ds-dark-theme');
+  const bg = dark ? 'var(--dsw-static-neutral-bluish-950)' : 'var(--dsw-static-neutral-bluish-50)';
+  const fg = dark ? 'var(--dsw-static-neutral-bluish-00)' : 'var(--dsw-static-neutral-bluish-950)';
+  const accent = 'var(--dsw-static-blue-500)';
+  const cs = getComputedStyle(document.documentElement);
+  const fgVal = (cs.getPropertyValue(dark ? '--dsw-static-neutral-bluish-00' : '--dsw-static-neutral-bluish-950') || '').trim();
+  const ring = fgVal.startsWith('rgb') ? fgVal.replace('rgb(', 'rgba(').replace(')', ',0.25)') : 'rgba(128,128,128,0.25)';
+  const el = document.createElement('div');
+  el.id = id;
+  el.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;background:' + bg + ';color:' + fg + ';';
+  el.innerHTML =
+    '<div style="width:48px;height:48px;border:4px solid ' + ring + ';border-top-color:' + accent + ';border-radius:50%;animation:__dsh_spin 1.1s linear infinite;"></div>' +
+    '<div style="font-size:15px;letter-spacing:2px;opacity:0.9;">版本切换中…</div>' +
+    '<style>@keyframes __dsh_spin{to{transform:rotate(360deg)}}</style>';
+  (document.body || document.documentElement).appendChild(el);
+})()"""
+
+_UPDATING_OVERLAY_HIDE_JS = (
+    "(() => { const el = document.getElementById('__dsh_updating__');"
+    " if (el) el.remove(); })()")
+
+
+# git log 日期格式: 精确到秒 (YYYY-MM-DD HH:MM:SS, 本地时间)
+_GIT_DATE_FMT = "--date=format:%Y-%m-%d %H:%M:%S"
+
+
+def _list_local_commits(limit: int = 100) -> tuple[list[dict], str]:
+    """读本地仓库 commit 列表 (新->旧) 与当前 HEAD。
+
+    --no-merges 展开 merge commit。优先读拉取分支 origin/master;
+    若 origin/master 缺失 (从未拉取成功) 则回退读当前分支 (HEAD) 历史,
+    保证列表始终有内容。返回 (commits, head_hash)。"""
+    def _parse(r) -> list[dict]:
+        out: list[dict] = []
+        if r[0] == 0 and r[1]:
+            for line in r[1].splitlines():
+                parts = line.split("\t", 2)
+                if len(parts) == 3:
+                    out.append({"hash": parts[0], "short": parts[0][:7],
+                                "date": parts[1], "subject": parts[2]})
+        return out
+
+    fmt = ["--format=%H%x09%ad%x09%s", _GIT_DATE_FMT, "-n", str(limit)]
+    commits = _parse(_git(["log", "origin/master", "--no-merges"] + fmt))
+    if not commits:
+        # origin/master 不存在 (从未拉取成功): 回退当前分支历史
+        commits = _parse(_git(["log", "HEAD", "--no-merges"] + fmt))
+    head_r = _git(["rev-parse", "HEAD"])
+    head = head_r[1].strip() if head_r[0] == 0 else ""
+    return commits, head
+
+
+def _build_update_dialog(titlebar) -> "object | None":
+    """构建升级对话框 (UI 线程调用): git log 风格版本单选列表 + 切换版本。
+
+    返回 Form 或 None (无更新信息时)。独立可测: 传入含 _update_info /
+    _dark / _scale / form 属性的对象即可 (见 DSH_DEMO_UPDATE 测试钩子)。"""
+    from System.Windows.Forms import (
+        Form, Label, RadioButton, Button, FormBorderStyle, DialogResult)
+    from System.Drawing import Color, Point, Size, Font, FontStyle
+    from System.Windows.Forms import MessageBox, MessageBoxButtons, MessageBoxIcon
+
+    info = getattr(titlebar, "_update_info", None)
+    # 检测失败/未检测 (info=None) 也打开: 列表显示本地历史, 可选择切换
+    if info is None:
+        info = {}
+    dark = bool(getattr(titlebar, "_dark", True))
+    s = max(1.0, float(getattr(titlebar, "_scale", 1.0)))
+
+    form = Form()
+    form.Text = "升级 DSH Desktop"
+    form.FormBorderStyle = FormBorderStyle(0)  # None (python 关键字冲突, 用枚举构造)
+    # pythonnet 3.x: StartPosition 枚举无法直接 import, 用 Enum.ToObject 构造 CenterParent
+    try:
+        from System import Enum as _Enum
+        form.StartPosition = _Enum.ToObject(form.StartPosition.GetType(), 4)
+    except Exception:
+        pass  # 缺省位置 (由系统摆放), 不影响功能
+    form.ShowInTaskbar = False
+    form.MaximizeBox = False
+    form.MinimizeBox = False
+    # 布局: 780x520 内容 + 自绘标题栏, 时间列显示到秒, 列表拉宽不拥挤
+    form.ClientSize = Size(int(780 * s), int(520 * s))
+    try:
+        form.Font = Font("Microsoft YaHei UI", 9.5)
+    except Exception:
+        pass
+    # 自绘标题栏 (主题色背景 + 图标 + 标题 + 关闭按钮, 可拖动)
+    tb = _install_dialog_chrome(form, "升级 DSH Desktop", dark, s,
+                                lambda: form.Close())
+    form.ClientSize = Size(int(780 * s), int(520 * s) + tb)
+
+    # 无边框窗口: DWM 圆角 + 边框色 = 主题背景色 (与主窗口一致)
+    _theme_bg = TITLEBAR_THEMES["dark" if dark else "light"]["bg"]
+
+    def _apply_dwm_border(_s=None, _e=None) -> None:
+        try:
+            hwnd = form.Handle.ToInt32()
+            _dwm = ctypes.WinDLL("dwmapi")
+            _dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+            _dwm.DwmSetWindowAttribute.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+            col = ctypes.c_int((_theme_bg[2] << 16) | (_theme_bg[1] << 8) | _theme_bg[0])
+            _dwm.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(col), 4)
+            corner = ctypes.c_int(2)  # DWMWA_WINDOW_CORNER_PREFERENCE = ROUND
+            _dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner), 4)
+            log(f"update dialog dwm border set: bg={_theme_bg}")
+        except Exception as ex:
+            log(f"update dialog dwm border failed: {ex}")
+
+    form.Shown += _apply_dwm_border
+    form.Shown += lambda s, e: _fit_columns()
+
+    def theme(control) -> None:
+        if dark:
+            control.BackColor = Color.FromArgb(30, 30, 33)
+            control.ForeColor = Color.FromArgb(229, 231, 235)
+
+    if dark:
+        form.BackColor = Color.FromArgb(21, 21, 23)
+        form.ForeColor = Color.FromArgb(229, 231, 235)
+
+    # ---------- 数据: 本地仓库拉取分支 (demo 模式用模拟数据) ----------
+    demo = bool(os.environ.get("DSH_DEMO_UPDATE", "").strip())
+    W = int(736 * s)
+    X = int(22 * s)
+    # 头部: 无背景框 (与窗体同色)
+    lbl_head = Label()
+    lbl_head.SetBounds(X, int(14 * s) + tb, W, int(36 * s))
+    lbl_head.AutoSize = False
+    lbl_head.Text = "已拉取最新仓库" if info else "连接github失败"
+    lbl_head.BackColor = form.BackColor
+    lbl_head.ForeColor = (Color.FromArgb(229, 231, 235) if dark
+                          else Color.FromArgb(31, 41, 55))
+    form.Controls.Add(lbl_head)
+
+    # ---------- git 样式列表 (ListView: 单选框 / 短哈希 / 日期 / 提交说明) ----------
+    from System.Windows.Forms import (ListView as _ListView, View as _View,
+                                      ColumnHeaderStyle as _CHS, ListViewItem)
+    lv = _ListView()
+    lv.SetBounds(X, int(58 * s) + tb, W, int(330 * s))
+    lv.View = _View.Details
+    lv.FullRowSelect = True
+    lv.MultiSelect = False
+    lv.HideSelection = False
+    lv.HeaderStyle = _CHS(0)            # None (隐藏表头, 更像 git log 文本)
+    # 列宽总和预留竖向滚动条, 避免出现横向滚动条
+    lv.Columns.Add("sel", int(34 * s))
+    lv.Columns.Add("hash", int(88 * s))
+    lv.Columns.Add("date", int(180 * s))
+    lv.Columns.Add("subject", int(W - 324 * s))
+    lv.BackColor = Color.FromArgb(30, 30, 33) if dark else Color.White
+    lv.ForeColor = Color.FromArgb(229, 231, 235) if dark else Color.FromArgb(31, 41, 55)
+    cur_fg = Color.FromArgb(148, 163, 184) if dark else Color.Gray
+    cur_bg = Color.FromArgb(56, 56, 60) if dark else Color.FromArgb(230, 230, 232)
+    # 单选列字体: ●/○ 是同一字体的配套几何符号 (外径一致), Segoe UI Symbol
+    # 渲染更清晰且圈更大, 避免默认字体下未选中圈偏小、与选中圈对不上
+    try:
+        from System.Drawing import Font as _Font
+        _radio_font = _Font("Segoe UI Symbol", 12.0)
+    except Exception:
+        _radio_font = None
+    form.Controls.Add(lv)
+
+    rows = []  # {"item": ListViewItem, "commit": dict, "current": bool}
+    _sel_guard = [False]
+    _last_sel = [0]
+
+    def _populate_list() -> None:
+        """读取本地仓库拉取分支的 commit 并填充列表 (打开/拉取最新后刷新)。"""
+        nonlocal rows
+        lv.BeginUpdate()
+        try:
+            lv.Items.Clear()
+            if demo:
+                commits = list(info.get("commits") or [])
+                head = info.get("head") or ""
+            else:
+                commits, head = _list_local_commits(limit=100)
+            # 当前版本不在列表时, 顶部插入"当前版本"行 (置灰不可选)
+            if head and not any(c.get("hash") == head for c in commits):
+                head_date = ""
+                if demo:
+                    head_date = "2026-01-01 08:30:00"
+                else:
+                    d = _git(["log", "-1", "--format=%ad", _GIT_DATE_FMT, head])
+                    if d[0] == 0 and d[1]:
+                        head_date = d[1].strip()
+                commits.insert(0, {"hash": head, "short": head[:7],
+                                   "date": head_date, "subject": ""})
+            rows = []
+            for c in commits:
+                is_cur = bool(head) and c.get("hash") == head
+                subject = c.get("subject", "")
+                label = (subject + "  （当前版本）") if is_cur else subject
+                # 第一列 = 单选框: 当前版本 ● 灰色选中; 其他 ○ 未选中
+                # ●/○ 配套字形外径一致; 该列用 _radio_font (Segoe UI Symbol) 渲染
+                item = ListViewItem("●" if is_cur else "○")
+                if _radio_font is not None:
+                    item.SubItems[0].Font = _radio_font
+                item.SubItems.Add(c.get("short", "?"))
+                item.SubItems.Add(c.get("date", ""))
+                item.SubItems.Add(label)
+                if is_cur:
+                    item.ForeColor = cur_fg
+                    item.BackColor = cur_bg     # 当前版本整行灰背景
+                lv.Items.Add(item)
+                rows.append({"item": item, "commit": c, "current": is_cur})
+            # 默认选中第一个可选项 (官方最新): 选中后当前版本行状态不变 (灰色 ● 保留)
+            for i, row in enumerate(rows):
+                if not row["current"]:
+                    lv.Items[i].Selected = True
+                    _last_sel[0] = i
+                    break
+        finally:
+            lv.EndUpdate()
+            _fit_columns()
+
+    def _fit_columns() -> None:
+        """列宽总和铺满列表宽度: 无竖向滚动条时整行铺满 (行背景/高亮颜色完整
+        显示到最右); 有竖向滚动条时给滚动条让位, 避免出现横向滚动条。"""
+        try:
+            scroll = 0
+            if lv.Items.Count > 0:
+                row_h = lv.Items[0].Bounds.Height
+                if row_h > 0 and lv.ClientSize.Height / row_h < lv.Items.Count:
+                    from System.Windows.Forms import SystemInformation
+                    scroll = SystemInformation.VerticalScrollBarWidth + 2
+            # 302 = sel(34) + hash(88) + date(180)
+            lv.Columns[3].Width = max(80, lv.ClientSize.Width - 302 - scroll)
+        except Exception as ex:
+            log(f"fit columns failed: {ex}")
+
+    # 单选列刷新: 选中行 ●, 其他可选项 ○, 当前版本行始终灰色 ● (状态不变)
+    def _refresh_radio_col() -> None:
+        sel = lv.SelectedIndices[0] if lv.SelectedIndices.Count > 0 else -1
+        for i, row in enumerate(rows):
+            if row["current"]:
+                row["item"].SubItems[0].Text = "●"   # 当前版本: 灰选中 (ForeColor 已是灰)
+            elif i == sel:
+                row["item"].SubItems[0].Text = "●"   # 用户选中行
+            else:
+                row["item"].SubItems[0].Text = "○"
+        lv.Invalidate()
+
+    # 当前版本行不可选: 拦截选择并回退到上一个有效选择
+    def _on_sel(sender, e) -> None:
+        if _sel_guard[0] or lv.SelectedIndices.Count == 0:
+            return
+        idx = lv.SelectedIndices[0]
+        if rows[idx]["current"]:
+            _sel_guard[0] = True
+            try:
+                if _last_sel[0] < len(rows) and not rows[_last_sel[0]]["current"]:
+                    lv.Items[_last_sel[0]].Selected = True
+                else:
+                    for i, row in enumerate(rows):
+                        if not row["current"]:
+                            lv.Items[i].Selected = True
+                            _last_sel[0] = i
+                            break
+            finally:
+                _sel_guard[0] = False
+            _refresh_radio_col()
+            return
+        _last_sel[0] = idx
+        _refresh_radio_col()
+
+    lv.SelectedIndexChanged += _on_sel
+    _populate_list()
+    _refresh_radio_col()
+
+    # ---------- 底部提示 + 按钮 (WebUI 风格: 圆角 + 主色蓝, 三个等宽) ----------
+    lbl_status = Label()
+    lbl_status.SetBounds(X, int(398 * s) + tb, W, int(36 * s))
+    lbl_status.AutoSize = False
+    lbl_status.Text = "选择对应commit后，点击切换版本后，立即生效"
+    lbl_status.BackColor = form.BackColor
+    if dark:
+        lbl_status.ForeColor = Color.FromArgb(148, 163, 184)
+    else:
+        lbl_status.ForeColor = Color.Gray
+    form.Controls.Add(lbl_status)
+
+    from System.Windows.Forms import FlatStyle
+    from System.Drawing import Region
+    from System.Drawing.Drawing2D import GraphicsPath
+
+    def _round_region(ctrl, radius: int):
+        w, h = ctrl.Width, ctrl.Height
+        path = GraphicsPath()
+        d = 2 * radius
+        path.AddArc(0, 0, d, d, 180, 90)
+        path.AddArc(w - d, 0, d, d, 270, 90)
+        path.AddArc(w - d, h - d, d, d, 0, 90)
+        path.AddArc(0, h - d, d, d, 90, 90)
+        path.CloseFigure()
+        return Region(path)
+
+    _radius = int(8 * s)
+    _btn_h = int(36 * s)
+    _gap = int(12 * s)
+    _right = int(780 * s) - int(22 * s)
+    _btn_y = int(444 * s) + tb
+    _w_ok = int(100 * s)     # 切换版本 (主按钮)
+    _w_fetch = int(120 * s)  # 获取最新仓库 (文字多, 稍宽)
+    _w_cancel = int(80 * s)  # 取消 (文字少, 稍窄)
+
+    def _secondary_btn(text: str) -> Button:
+        b = Button()
+        b.Text = text
+        b.FlatStyle = FlatStyle.Flat
+        b.FlatAppearance.BorderSize = 0
+        if dark:
+            b.BackColor = Color.FromArgb(30, 30, 33)
+            b.ForeColor = Color.FromArgb(229, 231, 235)
+            b.FlatAppearance.MouseOverBackColor = Color.FromArgb(47, 47, 49)
+        # Region 必须在最终尺寸下重建 (SetBounds 后 Resize 触发), 否则按默认尺寸
+        # (75x23) 裁剪, 视觉上高度与主按钮不一致
+        b.Region = _round_region(b, _radius)
+        b.Resize += lambda s, e: setattr(b, "Region", _round_region(b, _radius))
+        return b
+
+    btn_ok = Button()
+    btn_ok.SetBounds(_right - _w_ok, _btn_y, _w_ok, _btn_h)
+    btn_ok.Text = "切换版本"
+    btn_ok.FlatStyle = FlatStyle.Flat
+    btn_ok.FlatAppearance.BorderSize = 0
+    btn_ok.BackColor = Color.FromArgb(37, 99, 235)              # WebUI 主按钮蓝 #2563EB
+    btn_ok.FlatAppearance.MouseOverBackColor = Color.FromArgb(29, 78, 216)
+    btn_ok.ForeColor = Color.White
+    btn_ok.Region = _round_region(btn_ok, _radius)
+    btn_ok.Resize += lambda s, e: setattr(btn_ok, "Region", _round_region(btn_ok, _radius))
+    form.Controls.Add(btn_ok)
+
+    btn_fetch = _secondary_btn("获取最新仓库")
+    btn_fetch.SetBounds(_right - _w_ok - _gap - _w_fetch, _btn_y, _w_fetch, _btn_h)
+    form.Controls.Add(btn_fetch)
+
+    btn_cancel = _secondary_btn("取消")
+    btn_cancel.SetBounds(_right - _w_ok - _gap - _w_fetch - _gap - _w_cancel,
+                         _btn_y, _w_cancel, _btn_h)
+    form.Controls.Add(btn_cancel)
+
+    def _target_ref() -> str:
+        if lv.SelectedIndices.Count > 0:
+            return rows[lv.SelectedIndices[0]]["commit"]["hash"]
+        return "origin/master"
+
+    def _set_busy(busy: bool) -> None:
+        # 忙碌期间 (拉取仓库/切换版本): 切换版本 + 获取最新仓库按钮都禁用,
+        # 避免重复操作; 取消按钮始终可用 (用户仍可关闭对话框)。
+        btn_ok.Enabled = not busy
+        btn_fetch.Enabled = not busy
+        btn_cancel.Enabled = True
+        # 不禁用 lv: WinForms 禁用态会把深色背景画成系统白/灰
+
+    def _set_status(m: str) -> None:
+        try:
+            lbl_status.Text = m
+        except Exception:
+            pass
+
+    # ---------- "获取最新仓库": fetch 官方 master 并刷新列表 ----------
+    def _fetch_latest() -> None:
+        _set_busy(True)
+        _set_status("正在拉取最新仓库…")
+        log("manual fetch latest requested")
+
+        def _work() -> None:
+            try:
+                info2 = check_for_update()   # 内部 git fetch + 分析
+            except Exception as ex:
+                log(f"manual fetch failed: {ex}")
+                info2 = None
+            try:
+                from System import Action
+                form.Invoke(Action(lambda: _fetch_done(info2)))
+            except Exception:
+                pass
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _fetch_done(info2) -> None:
+        try:
+            if form.IsDisposed:
+                return
+            if info2 is not None:
+                # 更新标题栏状态 (红点/蓝色) 与本地信息
+                setter = getattr(titlebar, "set_update_info", None)
+                if setter is not None:
+                    setter(info2)
+                lbl_head.Text = "已拉取最新仓库"
+                _populate_list()          # 刷新列表 (可能出现新 commit)
+                _set_status("已拉取最新仓库，选择目标后点击切换版本。")
+            else:
+                lbl_head.Text = "连接github失败"
+                _set_status("拉取失败，请检查网络/代理后重试。")
+            _set_busy(False)
+        except Exception as ex:
+            log(f"fetch done failed: {ex}")
+            _set_busy(False)
+
+    def _finish_update(ok: bool, msg: str, demo_mode: bool) -> None:
+        """切换流程收尾 (对话框已关闭, 由主窗口 UI 线程调用)。
+
+        成功: 保持覆盖层 -> 自动重建并重开画面 (demo 模式仅移除覆盖层);
+        失败: 移除覆盖层 + 弹窗提示。"""
+        try:
+            if ok:
+                if demo_mode:
+                    hide = getattr(titlebar, "_hide_updating_overlay", None)
+                    if hide is not None:
+                        hide()
+                else:
+                    _start_rebuild_after_switch(titlebar)
+                return
+            hide = getattr(titlebar, "_hide_updating_overlay", None)
+            if hide is not None:
+                hide()
+            try:
+                MessageBox.Show(titlebar.form, msg, "切换失败",
+                                MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            except Exception:
+                pass
+        except Exception as ex:
+            log(f"update finish failed: {ex}")
+
+    def _start_update() -> None:
+        target = _target_ref()
+        # 点击"切换版本": 立即关闭升级对话框, 切换与重建全程在后台进行,
+        # 主界面显示"版本切换中…"覆盖层 (页面刷新后自动消失)
+        form.DialogResult = DialogResult.OK
+        form.Close()
+        show_overlay = getattr(titlebar, "_show_updating_overlay", None)
+        if show_overlay is not None:
+            show_overlay()
+
+        def _work() -> None:
+            try:
+                ok, msg = perform_update(target, progress=None, demo=demo)
+            except Exception as ex:
+                log(f"update work failed: {ex}")
+                ok, msg = False, f"切换出错: {ex}"
+            try:
+                from System import Action
+                titlebar.form.Invoke(Action(lambda: _finish_update(ok, msg, demo)))
+            except Exception:
+                _finish_update(ok, msg, demo)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    btn_ok.Click += lambda s, e: _start_update()
+    btn_fetch.Click += lambda s, e: _fetch_latest()
+    btn_cancel.Click += lambda s, e: form.Close()
+    return form
+
+
+def show_update_dialog(titlebar) -> None:
+    """弹出升级对话框 (模态, UI 线程调用)。"""
+    form = _build_update_dialog(titlebar)
+    if form is None:
+        return
+    try:
+        form.ShowDialog(getattr(titlebar, "form", None))
+    except Exception as ex:
+        log(f"update dialog show failed: {ex}")
+    finally:
+        try:
+            form.Dispose()
+        except Exception:
+            pass
 
 
 def inject_theme_sync(window) -> None:
@@ -1993,14 +4285,66 @@ def main() -> int:
         return 0
     threading.Thread(target=_watch_show_window_event, daemon=True).start()
 
+    # 0.5) 启动加载窗 (构建/后端启动/等待就绪期间显示, 主窗口显示后关闭)
+    _start_splash()
+    _splash_set_progress(3, "正在启动 DSH Desktop…")
+
+    # 0.6) 首次安装: release 包不带后端仓库, 首次启动用内嵌 git 拉取官方仓库
+    if not _repo_valid():
+        if _git_worktree_ok():
+            # 有有效 .git: 断点续传 (进度条从 0 走是本次传输进度, 不是重新下载)
+            _splash_set_progress(5, "首次安装：检测到已下载内容，正在续传…")
+        else:
+            _splash_set_progress(5, "首次安装：正在从官方仓库拉取代码（需联网）…")
+        if not _clone_repo():
+            if _ACTIVE["cancel"]:
+                log("startup cancelled during clone")
+                return 0
+            _close_splash()
+            log("first-run clone failed")
+            if _git_worktree_ok():
+                # .git 有效 = 网络拉取失败, 已下载部分可续传
+                _show_fatal("拉取官方仓库失败",
+                            "无法从官方仓库拉取代码（网络或代理问题）。\n"
+                            "建议配置好 GitHub SSH key（推荐）：SSH 拉取最稳定，\n"
+                            "不受 HTTPS 认证/限流影响，请检查网络后重新启动应用。\n"
+                            "已下载的部分已保留，下次启动会自动继续，无需删除文件夹；\n"
+                            "若直连失败，可设置 DSH_GIT_PROXY 代理后重试。")
+            else:
+                # .git 无效 = 初始化/残留清理失败 (权限等)
+                _show_fatal("拉取官方仓库失败",
+                            "无法初始化官方仓库（残留目录清理失败，可能权限不足）。\n"
+                            f"请手动删除 {SOURCE} 后重试，或以管理员身份运行。")
+            return 1
+    # 依赖完整判定: 以 pnpm 的完成标记 node_modules/.modules.yaml 为准。
+    # 只查目录存在会误判"上次失败留下的部分 node_modules"为已装好,
+    # 导致跳过 install 直接 build 失败。
+    if not (SOURCE / "node_modules" / ".modules.yaml").is_file():
+        _splash_set_progress(30, "首次安装：正在安装依赖（需要几分钟）…")
+        if not _install_deps():
+            if _ACTIVE["cancel"]:
+                log("startup cancelled during pnpm install")
+                return 0
+            _close_splash()
+            log("first-run pnpm install failed")
+            _show_fatal("安装依赖失败",
+                        "依赖安装未完成（网络或磁盘问题）。\n请检查后重新启动应用。")
+            return 1
+
     # 1) 检测更新, 需要时构建
     rebuild_needed, cur_fp = needs_build()
     if rebuild_needed:
+        _splash_set_progress(10, "正在构建后端（首次启动需要几分钟）…")
         if not run_build():
+            if _ACTIVE["cancel"]:
+                log("startup cancelled during build")
+                return 0
             log("build failed, see build console window")
+            _close_splash()
             return 1
         if cur_fp:
             record_fingerprint(cur_fp)
+        _splash_set_progress(60, "构建完成")
 
     # 2) 创建 Job (KILL_ON_JOB_CLOSE): 本进程退出 -> 后端必死 (内核级, 含强杀)
     global _JOB_HANDLE
@@ -2026,6 +4370,7 @@ def main() -> int:
             log("port occupied by non-DSH process, reusing (no job control)")
     if not port_in_use:
         log("port free, starting backend")
+        _splash_set_progress(65, "正在启动后端…")
         proc = start_backend()
         started_by_us = True
         if _assign_pid_to_job(_JOB_HANDLE, proc.pid):
@@ -2038,6 +4383,8 @@ def main() -> int:
     ready = False
     t0 = time.time()
     while time.time() < deadline:
+        if _ACTIVE["cancel"]:
+            break
         if proc is not None and proc.poll() is not None:
             log(f"backend exited early with code={proc.returncode}")
             break
@@ -2045,14 +4392,24 @@ def main() -> int:
             ready = True
             break
         time.sleep(0.5)
+        # 等待就绪期间进度随时间平滑推进 (65% → 95%, 封顶)
+        _splash_set_progress(min(95.0, 65.0 + (time.time() - t0) / WAIT_TIMEOUT * 30.0))
     if ready:
         log(f"backend ready after {time.time() - t0:.1f}s")
+        _splash_set_progress(98, "后端就绪，正在打开界面…")
 
     if not ready:
+        if _ACTIVE["cancel"]:
+            log("startup cancelled while waiting for backend")
+            if started_by_us and proc is not None:
+                kill_tree(proc.pid)
+            _close_splash()
+            return 0
         log("backend NOT ready in time")
         if started_by_us and proc is not None:
             kill_tree(proc.pid)
         log(f"backend not ready within {WAIT_TIMEOUT}s; check pnpm install in Source")
+        _close_splash()
         return 1
 
     # 5) WebView2 窗口 (frameless + 原生自绘标题栏)
@@ -2062,6 +4419,7 @@ def main() -> int:
         if started_by_us and proc is not None:
             kill_tree(proc.pid)
         log(f"webview import failed: {e}; run 00_env.bat (creates DSH_Desktop/.venv with pywebview)")
+        _close_splash()
         return 1
 
     # 启动前 patch pywebview WinForms: BrowserForm 在 Load 事件 (窗口显示前)
@@ -2088,7 +4446,7 @@ def main() -> int:
     init_bg_rgb = dark_bg if init_dark else light_bg
     init_bg = "#%02X%02X%02X" % init_bg_rgb
     window = webview.create_window(
-        "DeepSeek Harness",
+        "DSH Desktop",
         URL,
         width=1366,
         height=860,
@@ -2156,6 +4514,7 @@ def main() -> int:
             bar = TitleBar(window)
             bar.install()
             api.bind(bar)
+            bar.start_update_checker()  # 后台定期检测官方仓库更新 (蓝色提示)
             window._titlebar_ref = bar  # 保活, 防 GC 导致事件失效
             log("custom titlebar installed")
         except Exception as e:
@@ -2225,6 +4584,7 @@ def main() -> int:
 
     window.events.before_show += on_before_show
     window.events.shown += on_shown
+    window.events.shown += _close_splash  # 主窗口显示后关闭加载窗
     window.events.loaded += on_loaded
     # 清理已退出实例残留的独立 WebView2 数据目录 (本实例目录随窗口创建)
     _cleanup_old_webview2_dirs()

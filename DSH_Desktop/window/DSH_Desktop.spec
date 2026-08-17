@@ -62,7 +62,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Deepseek Harness',
+    name='DSH_Desktop',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
