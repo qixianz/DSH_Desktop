@@ -896,6 +896,44 @@ def _install_deps() -> bool:
     return ok
 
 
+def _backend_log_path() -> Path:
+    """后端子进程 stdout/stderr 落盘路径 (每次启动一个文件, 失败可诊断)。
+
+    原实现把后端输出 DEVNULL 丢弃, 启动失败 (如覆盖安装后文件锁/杀软扫描
+    导致 node 加载模块失败) 时只能看到 "exited early with code=1", 无法定位。
+    现在输出落盘到 data/logs/backend-<时间戳>.log。"""
+    log_dir = DATA_DIR / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return log_dir / ("backend-" + time.strftime("%Y%m%d-%H%M%S") + ".log")
+
+
+_BACKEND_PORT_IN_USE: bool = False  # 全局: 后端端口当前是否被非 DSH 进程占用
+
+
+def _port_reuse_check() -> None:
+    """探测后端端口: 残留的 DSH 后端 -> 杀掉重启 (纳入新 Job 保强相关);
+    被非 DSH 进程占用 -> 复用 (不启动新后端, 期待现有服务就绪)。"""
+    global _BACKEND_PORT_IN_USE
+    if port_open("127.0.0.1", PORT):
+        pid = _find_listener_pid(PORT)
+        if pid is not None and _is_our_backend(pid):
+            log(f"residual backend pid={pid}, killing and restarting under job")
+            kill_tree(pid)
+            for _ in range(20):
+                if not port_open("127.0.0.1", PORT):
+                    break
+                time.sleep(0.25)
+            _BACKEND_PORT_IN_USE = port_open("127.0.0.1", PORT)
+        else:
+            log("port occupied by non-DSH process, reusing (no job control)")
+            _BACKEND_PORT_IN_USE = True
+    else:
+        _BACKEND_PORT_IN_USE = False
+
+
 def start_backend() -> subprocess.Popen | None:
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     si = None
@@ -903,11 +941,21 @@ def start_backend() -> subprocess.Popen | None:
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = subprocess.SW_HIDE
+    # 后端 stdout/stderr 落盘 (原 DEVNULL: 失败原因完全不可见)。
+    # 二进制追加模式: 子进程按 fd 写入, 不经过父进程缓冲, 实时可见。
+    bf = None
+    try:
+        bf = open(_backend_log_path(), "ab", buffering=0)
+    except OSError:
+        pass
     p = subprocess.Popen(
         _start_cmd(), cwd=str(SOURCE), env=_node_env(),
         creationflags=flags, startupinfo=si,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=bf, stderr=bf,
     )
+    if bf is not None:
+        # Popen 已把该 fd 交给子进程; 父进程关闭自己的引用即可 (子进程继续持有)
+        bf.close()
     # 登记为当前活动子进程: splash 关闭按钮 (_cancel_startup) 能直接
     # 杀掉等待就绪阶段的后端, 不依赖 main 循环的检查时机。
     _ACTIVE["proc"] = p
@@ -1137,9 +1185,11 @@ def _quit_application() -> None:
         log(f"quit close failed: {ex}")
 
 
-def _setup_tray(form) -> None:
+def _setup_tray(form, scale: float = 1.0) -> None:
     """创建系统托盘图标 (WinForms NotifyIcon, 复用 pythonnet)。
-    右键菜单: 显示窗口 / 退出; 双击 = 显示窗口。"""
+    右键菜单: 显示窗口 / 退出; 双击 = 显示窗口。
+    scale = 屏幕 DPI 缩放比 (1.0=100%, 1.75=175%): 菜单字体随之放大,
+    否则高分屏/大缩放下菜单字显小。"""
     global _TRAY
     try:
         from System.Windows.Forms import (
@@ -1156,6 +1206,15 @@ def _setup_tray(form) -> None:
         ni.Text = "DSH Desktop"
         ni.Visible = True
         menu = ContextMenuStrip()
+        # 托盘菜单字体: 固定 9pt, 与更新对话框文字(9.5pt)同级。
+        # 不跟随系统默认菜单字体 (SystemFonts 在 175% 缩放下会放大到
+        # ~15.75pt, 用户反馈偏大); pt 是物理单位, 任何分辨率/缩放下的
+        # 视觉大小都适中。若需随缩放微调可改用 9.0 * (scale ** 0.3)。
+        try:
+            from System.Drawing import Font as _TrayFont
+            menu.Font = _TrayFont("Microsoft YaHei UI", 9.0)
+        except Exception:
+            pass
         show_item = ToolStripMenuItem("显示窗口")
         quit_item = ToolStripMenuItem("退出")
         show_item.Click += lambda s, e: _show_main_window()
@@ -1295,7 +1354,8 @@ class TitleBar:
         self._upd_font = None          # 通知文字字体 (缓存)
         self._upd_thread_started = False
         self._update_dialog_open = False
-        self._update_seen_hash = _read_update_seen()  # 已读的最新提交 (红点判断)
+        # 升级通知持久化状态: 基准 B(上次拉取的最新 commit) + pending(是否有未查看的新 commit)
+        self._update_base_hash, self._update_pending = _read_update_state()
 
     def install(self) -> None:
         from System.Windows.Forms import DockStyle, ControlStyles
@@ -1309,10 +1369,11 @@ class TitleBar:
         self._scale = max(1.0, user32.GetDpiForWindow(hwnd) / 96.0)
         self._tb_h = int(TITLEBAR_HEIGHT * self._scale)
         self._btn_w = int(BTN_WIDTH * self._scale)
-        # 升级通知文字字体 (9pt, GDI+ 按屏幕 DPI 自动缩放; 微软雅黑缺失时回落系统字体)
+        # 升级通知文字字体 (9pt, 标准大小; 微软雅黑缺失时回落系统字体)
         try:
             from System.Drawing import Font, FontStyle, SystemFonts
-            self._upd_font = Font("Microsoft YaHei UI", 9.0, FontStyle.Regular)
+            self._upd_font = Font("Microsoft YaHei UI",
+                                  9.0, FontStyle.Regular)
         except Exception:
             try:
                 from System.Drawing import SystemFonts
@@ -1666,7 +1727,8 @@ class TitleBar:
 
     def _draw_update_notice(self, g, info) -> None:
         """绘制常驻"检查更新"按钮 (最小化按钮左侧, 无背景色):
-        图标 + "检查更新"文字, 平时灰色; 有更新时变蓝色 + 红点 (点击一次后消失)。"""
+        图标 + "检查更新"文字, 常态灰色; 有未查看的新 commit (pending=1)
+        时变蓝色 + 红点 (点开对话框=已查看后恢复灰色, 持久化)。"""
         from System.Drawing import Pen, SolidBrush, RectangleF
         from System.Drawing.Drawing2D import SmoothingMode, LineCap
         from System.Drawing.Text import TextRenderingHint
@@ -1674,7 +1736,8 @@ class TitleBar:
         font = self._upd_font
         if font is None:
             return
-        available = bool(info and info.get("available"))
+        # 亮色 = pending (未查看的新 commit), 与 info.available 无关
+        available = bool(self._update_pending)
         hover = bool(self._update_hover)
         if available:
             color = c["upd_hover"] if hover else c["upd"]
@@ -1716,7 +1779,7 @@ class TitleBar:
             y_text = (self._tb_h - size.Height) / 2.0
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit
             g.DrawString(text, font, brush, x_text, y_text)
-            # 红点: 有更新且未读 (点击一次后消失, 持久化)
+            # 红点: pending=1 (有未查看的新 commit, 持久化, 点开对话框后消失)
             if available and self._show_update_badge(info):
                 r = 3.5 * s
                 bx = x_icon + icon_w - 1.0 * s
@@ -1733,17 +1796,14 @@ class TitleBar:
             brush.Dispose()
 
     def _show_update_badge(self, info) -> bool:
-        """红点是否显示: 有更新 且 最新提交 != 已读记录 (点击一次后消失)。"""
-        latest = (info or {}).get("latest") or ""
-        return bool(latest) and latest != self._update_seen_hash
+        """红点是否显示: pending=1 (有未查看的新 commit)。"""
+        return bool(self._update_pending)
 
-    def _mark_update_seen(self, latest_hash: str) -> None:
-        """记录已读 (打开升级对话框时调用), 红点消失并持久化到文件。"""
-        self._update_seen_hash = latest_hash
-        try:
-            SEEN_MARKER.write_text(latest_hash + "\n", encoding="utf-8")
-        except OSError as ex:
-            log(f"update seen marker write failed: {ex}")
+    def _mark_update_seen(self) -> None:
+        """点开"检查更新"对话框 = 已查看: 清 pending (蓝字红点恢复灰色),
+        持久化到文件; 基准 B 不动 (基准只在 fetch 后更新)。"""
+        self._update_pending = 0
+        _save_update_state(self._update_base_hash, 0)
         self._invalidate_titlebar()
 
     def _show_updating_overlay(self) -> None:
@@ -2000,16 +2060,69 @@ class TitleBar:
         r = self._update_rect
         return r is not None and r.Contains(x, y)
 
+    def _handle_check_result(self, info) -> None:
+        """后台自动检测结果处理 (start_update_checker 调用):
+
+        对比本次拉取的 origin/master (latest) 与基准 B:
+        - 首次 (无 B): 写入基准, 不亮 (第一次没有"之前的最新 commit"可比)
+        - latest != B: 有新 commit -> 亮 (pending=1), 并更新基准
+        - latest == B: 无变化, pending 保持 (亮着继续亮, 灰着继续灰)
+        - fetch 失败 (info=None): 不动, 保持现状
+        demo 模式: 直接亮 (测试钩子, 不走持久化, 避免污染真实状态)。"""
+        if not info:
+            return
+        if info.get("demo"):
+            self._update_pending = 1
+            self._invalidate_titlebar()
+            self.set_update_info(info)
+            return
+        latest = (info.get("latest") or "").strip()
+        if not latest:
+            self.set_update_info(info)
+            return
+        base = self._update_base_hash
+        if not base:
+            # 首次: 写入基准, 不亮
+            self._update_base_hash = latest
+            self._update_pending = 0
+            _save_update_state(latest, 0)
+            log(f"update: first check, baseline set to {latest[:7]}")
+        elif latest != base:
+            # 有新 commit: 亮 + 更新基准
+            self._update_base_hash = latest
+            self._update_pending = 1
+            _save_update_state(latest, 1)
+            log(f"update: new commit {latest[:7]} (baseline was {base[:7]}), badge on")
+        else:
+            log(f"update: no change ({latest[:7]}), badge state kept")
+        self._invalidate_titlebar()
+        self.set_update_info(info)
+
+    def _handle_manual_fetch(self, info) -> None:
+        """对话框内手动"获取最新仓库"结果处理 (_fetch_done 调用):
+
+        用户已打开对话框 (=已查看), 只更新基准 B, 不置 pending
+        (红点蓝字不需要); pending 保持原值。"""
+        if not info:
+            return
+        latest = (info.get("latest") or "").strip()
+        if latest and latest != self._update_base_hash:
+            self._update_base_hash = latest
+            _save_update_state(latest, self._update_pending)
+            log(f"update: manual fetch, baseline updated to {latest[:7]}")
+        self._invalidate_titlebar()
+        self.set_update_info(info)
+
     def set_update_info(self, info) -> None:
         """更新检测结果 (后台线程调用, 内部封送 UI 线程)。
 
-        info=None 表示检测失败 (保持现状); available=False 表示无更新 (隐藏提示)。"""
+        info=None 表示检测失败 (保持现状)。亮/灰由持久化的 pending 状态
+        (_update_pending) 驱动, 与 info 的 available 无关; 灰色同样可点击
+        (打开版本列表查看/切换)。"""
         def _apply() -> None:
             self._update_info = info
             self._update_hover = False
             self._update_pressed = False
-            if not info or not info.get("available"):
-                self._update_rect = None
             self._invalidate_titlebar()
             # 演示模式自动弹出对话框 (仅测试钩子, 正常模式不受影响)
             if (info and info.get("demo")
@@ -2037,13 +2150,9 @@ class TitleBar:
             return
         self._update_dialog_open = True
         try:
-            info = self._update_info
             # 总是打开版本列表界面 (git 样式): 不管有没有更新都可选历史版本切换。
-            # 有更新时先标记已读 (红点消失, 持久化)。
-            if info and info.get("available"):
-                latest = info.get("latest") or ""
-                if latest:
-                    self._mark_update_seen(latest)
+            # 点开 = 已查看: 清 pending (蓝字红点恢复灰色, 持久化; 基准 B 不动)
+            self._mark_update_seen()
             show_update_dialog(self)
         except Exception as ex:
             log(f"update dialog open failed: {ex}")
@@ -2209,7 +2318,7 @@ class TitleBar:
                         log("update check: " + (
                             f"update available ({info['count']} commits)"
                             if info.get("available") else "up to date"))
-                        self.set_update_info(info)
+                        self._handle_check_result(info)
                     time.sleep(interval)
             except Exception as ex:
                 log(f"update checker stopped: {ex}")
@@ -2671,16 +2780,31 @@ def _git(args: list[str], timeout: float = 180.0) -> tuple[int, str, str]:
     return last if last is not None else (-1, "", "git unavailable")
 
 
-def _read_update_seen() -> str:
-    """读取升级通知"已读"标记 (已查看过的最新提交哈希), 无则空串。
+def _read_update_state() -> tuple[str, int]:
+    """读取升级通知持久化状态 (last-update-seen.txt, 两行):
+    第 1 行 = 上次拉取记录的最新 origin/master commit (基准 B);
+    第 2 行 = pending (1=有未查看的新 commit, 标题栏蓝字+红点; 0=已查看/无新更新)。
 
-    用途: 红点显隐判断 (点击升级按钮后记录, 重启后仍记住)。"""
+    语义: 亮/灭完全由 pending 驱动, 落盘后关闭程序再启动仍保留;
+    基准 B 在每次 fetch 后更新, "点开对话框=已查看"只清 pending 不动 B。"""
     try:
         if SEEN_MARKER.exists():
-            return SEEN_MARKER.read_text(encoding="utf-8").strip()
+            lines = SEEN_MARKER.read_text(encoding="utf-8").splitlines()
+            base = lines[0].strip() if lines else ""
+            pending = 1 if (len(lines) > 1 and lines[1].strip() == "1") else 0
+            return base, pending
     except OSError:
         pass
-    return ""
+    return "", 0
+
+
+def _save_update_state(base: str, pending: int) -> None:
+    """持久化升级通知状态 (基准 B + pending), 供启动恢复。"""
+    try:
+        SEEN_MARKER.write_text(
+            f"{(base or '').strip()}\n{1 if pending else 0}\n", encoding="utf-8")
+    except OSError as ex:
+        log(f"update state write failed: {ex}")
 
 
 def _demo_update_info(seed: str) -> dict:
@@ -2829,7 +2953,9 @@ def perform_update(target_ref: str, progress=None, demo: bool = False) -> tuple[
                     cwd=str(SOURCE), env=_node_env(),
                     capture_output=True, text=True, timeout=900)
     if pi.returncode != 0:
-        log("update: pnpm install failed: " + ((pi.stderr or "")[-400:]))
+        log("update: pnpm install failed (exit=" + str(pi.returncode) + ")")
+        log("update: pnpm install stdout tail: " + ((pi.stdout or "")[-600:]).strip())
+        log("update: pnpm install stderr tail: " + ((pi.stderr or "")[-600:]).strip())
         msg = (f"已切换到 {new_head[:12]}（强制切换，工作区改动已丢弃）。"
                "依赖安装未完成 (pnpm install 失败), 重新构建可能失败。")
     else:
@@ -3534,16 +3660,18 @@ def _build_update_dialog(titlebar) -> "object | None":
     form.ShowInTaskbar = False
     form.MaximizeBox = False
     form.MinimizeBox = False
-    # 布局: 780x520 内容 + 自绘标题栏, 时间列显示到秒, 列表拉宽不拥挤
-    form.ClientSize = Size(int(780 * s), int(520 * s))
+    # 布局: 880x520 内容 + 自绘标题栏, 时间列显示到秒, 列表拉宽不拥挤
+    form.ClientSize = Size(int(880 * s), int(520 * s))
     try:
+        # 头部文字/按钮保持标准 9.5pt (用户确认此大小正常);
+        # commit 列表字体的放大见下方 lv.Font (单独乘 s)
         form.Font = Font("Microsoft YaHei UI", 9.5)
     except Exception:
         pass
     # 自绘标题栏 (主题色背景 + 图标 + 标题 + 关闭按钮, 可拖动)
     tb = _install_dialog_chrome(form, "升级 DSH Desktop", dark, s,
                                 lambda: form.Close())
-    form.ClientSize = Size(int(780 * s), int(520 * s) + tb)
+    form.ClientSize = Size(int(880 * s), int(520 * s) + tb)
 
     # 无边框窗口: DWM 圆角 + 边框色 = 主题背景色 (与主窗口一致)
     _theme_bg = TITLEBAR_THEMES["dark" if dark else "light"]["bg"]
@@ -3577,7 +3705,7 @@ def _build_update_dialog(titlebar) -> "object | None":
 
     # ---------- 数据: 本地仓库拉取分支 (demo 模式用模拟数据) ----------
     demo = bool(os.environ.get("DSH_DEMO_UPDATE", "").strip())
-    W = int(736 * s)
+    W = int(836 * s)
     X = int(22 * s)
     # 头部: 无背景框 (与窗体同色)
     lbl_head = Label()
@@ -3594,6 +3722,12 @@ def _build_update_dialog(titlebar) -> "object | None":
                                       ColumnHeaderStyle as _CHS, ListViewItem)
     lv = _ListView()
     lv.SetBounds(X, int(58 * s) + tb, W, int(330 * s))
+    try:
+        # commit 列表字体: 8.5pt * 缩放 (比 9.5pt 小一号, 列表内容更宽松;
+        # 头部文字/按钮仍是标准 9.5pt, 见 form.Font)
+        lv.Font = Font("Microsoft YaHei UI", 8.5 * s)
+    except Exception:
+        pass
     lv.View = _View.Details
     lv.FullRowSelect = True
     lv.MultiSelect = False
@@ -3609,10 +3743,11 @@ def _build_update_dialog(titlebar) -> "object | None":
     cur_fg = Color.FromArgb(148, 163, 184) if dark else Color.Gray
     cur_bg = Color.FromArgb(56, 56, 60) if dark else Color.FromArgb(230, 230, 232)
     # 单选列字体: ●/○ 是同一字体的配套几何符号 (外径一致), Segoe UI Symbol
-    # 渲染更清晰且圈更大, 避免默认字体下未选中圈偏小、与选中圈对不上
+    # 渲染更清晰且圈更大, 避免默认字体下未选中圈偏小、与选中圈对不上。
+    # 随列表字体同步缩小一号 (11pt * scale, 与 8.5pt 列表文字协调)。
     try:
         from System.Drawing import Font as _Font
-        _radio_font = _Font("Segoe UI Symbol", 12.0)
+        _radio_font = _Font("Segoe UI Symbol", 11.0 * s)
     except Exception:
         _radio_font = None
     form.Controls.Add(lv)
@@ -3681,8 +3816,11 @@ def _build_update_dialog(titlebar) -> "object | None":
                 if row_h > 0 and lv.ClientSize.Height / row_h < lv.Items.Count:
                     from System.Windows.Forms import SystemInformation
                     scroll = SystemInformation.VerticalScrollBarWidth + 2
-            # 302 = sel(34) + hash(88) + date(180)
-            lv.Columns[3].Width = max(80, lv.ClientSize.Width - 302 - scroll)
+            # 前 3 列实际宽度 = sel(34*s) + hash(88*s) + date(180*s)。
+            # 必须用缩放后的值: 原来硬编码 302 (未乘 s), 缩放 >1 时 subject
+            # 列被设得过宽, 总和超出列表宽度 -> 出现横向滚动条。
+            used = int(34 * s) + int(88 * s) + int(180 * s)
+            lv.Columns[3].Width = max(80, lv.ClientSize.Width - used - scroll)
         except Exception as ex:
             log(f"fit columns failed: {ex}")
 
@@ -3755,7 +3893,7 @@ def _build_update_dialog(titlebar) -> "object | None":
     _radius = int(8 * s)
     _btn_h = int(36 * s)
     _gap = int(12 * s)
-    _right = int(780 * s) - int(22 * s)
+    _right = int(880 * s) - int(22 * s)
     _btn_y = int(444 * s) + tb
     _w_ok = int(100 * s)     # 切换版本 (主按钮)
     _w_fetch = int(120 * s)  # 获取最新仓库 (文字多, 稍宽)
@@ -3841,10 +3979,10 @@ def _build_update_dialog(titlebar) -> "object | None":
             if form.IsDisposed:
                 return
             if info2 is not None:
-                # 更新标题栏状态 (红点/蓝色) 与本地信息
-                setter = getattr(titlebar, "set_update_info", None)
-                if setter is not None:
-                    setter(info2)
+                # 手动拉取: 只更新基准 B (红点蓝字不需要, 用户已在查看界面)
+                updater = getattr(titlebar, "_handle_manual_fetch", None)
+                if updater is not None:
+                    updater(info2)
                 lbl_head.Text = "已拉取最新仓库"
                 _populate_list()          # 刷新列表 (可能出现新 commit)
                 _set_status("已拉取最新仓库，选择目标后点击切换版本。")
@@ -4359,50 +4497,74 @@ def main() -> int:
     # 3) 启动后端 (强相关: 尽量由本进程启动并纳入 Job)
     proc = None
     started_by_us = False
-    port_in_use = port_open("127.0.0.1", PORT)
-    if port_in_use:
-        pid = _find_listener_pid(PORT)
-        if pid is not None and _is_our_backend(pid):
-            # 残留的旧后端 (非本进程 Job 管理): 杀掉重启, 纳入新 Job 保证强相关
-            log(f"residual backend pid={pid}, killing and restarting under job")
-            kill_tree(pid)
-            for _ in range(20):
-                if not port_open("127.0.0.1", PORT):
-                    break
-                time.sleep(0.25)
-            port_in_use = port_open("127.0.0.1", PORT)
-        else:
-            # 被非 DSH 进程占用: 不敢杀, 只能复用 (此场景无法保证强相关)
-            log("port occupied by non-DSH process, reusing (no job control)")
-    if not port_in_use:
-        log("port free, starting backend")
-        _splash_set_progress(65, "正在启动后端…")
-        proc = start_backend()
-        started_by_us = True
-        if _assign_pid_to_job(_JOB_HANDLE, proc.pid):
-            log(f"backend pid={proc.pid} assigned to kill-on-close job")
-        else:
-            log("assign to job failed, fallback to kill_tree on exit")
+    _port_reuse_check()  # 清理残留后端/复用非 DSH 占用 (写回 _BACKEND_PORT_IN_USE)
 
-    # 4) 等待就绪
-    deadline = time.time() + WAIT_TIMEOUT
+    # 4) 等待就绪; 提前退出 (瞬态故障: 覆盖安装后文件锁/杀软扫描等) 自动重试。
+    #    修复: 原实现后端一次失败 (exit code=1) 就直接关 splash 退出,
+    #    用户看到"启动页面加载完程序就没了"且毫无提示。现在最多重试
+    #    DSH_BACKEND_ATTEMPTS 次 (默认 3), 每次间隔 DSH_BACKEND_RETRY_DELAY
+    #    秒 (默认 3), 消化覆盖安装/杀软扫描这类数秒内自愈的瞬时故障;
+    #    重试仍失败时弹窗给出具体原因与日志位置, 而不是无声退出。
+    MAX_BACKEND_ATTEMPTS = int(os.environ.get("DSH_BACKEND_ATTEMPTS", "3"))
+    BACKEND_RETRY_DELAY = float(os.environ.get("DSH_BACKEND_RETRY_DELAY", "3"))
     ready = False
-    t0 = time.time()
-    while time.time() < deadline:
+    last_code: int | None = None
+    attempt = 0
+    while attempt < MAX_BACKEND_ATTEMPTS and not ready:
+        attempt += 1
+        if _ACTIVE["cancel"]:
+            break
+        if attempt > 1:
+            _splash_set_progress(62, f"后端启动失败，{BACKEND_RETRY_DELAY:.0f} 秒后进行第 {attempt} 次重试…")
+            log(f"backend retry {attempt}/{MAX_BACKEND_ATTEMPTS} in {BACKEND_RETRY_DELAY:.0f}s")
+            time.sleep(BACKEND_RETRY_DELAY)
+            _port_reuse_check()
+
+        if not _BACKEND_PORT_IN_USE:
+            log(f"port free, starting backend (attempt {attempt})")
+            _splash_set_progress(65, "正在启动后端…")
+            proc = start_backend()
+            started_by_us = True
+            if _assign_pid_to_job(_JOB_HANDLE, proc.pid):
+                log(f"backend pid={proc.pid} assigned to kill-on-close job")
+            else:
+                log("assign to job failed, fallback to kill_tree on exit")
+
+        deadline = time.time() + WAIT_TIMEOUT
+        t0 = time.time()
+        while time.time() < deadline:
+            if _ACTIVE["cancel"]:
+                break
+            if proc is not None and proc.poll() is not None:
+                last_code = proc.returncode
+                log(f"backend exited early with code={last_code} (attempt {attempt})")
+                break
+            if http_ready():
+                ready = True
+                break
+            time.sleep(0.5)
+            # 等待就绪期间进度随时间平滑推进 (65% → 95%, 封顶)
+            _splash_set_progress(min(95.0, 65.0 + (time.time() - t0) / WAIT_TIMEOUT * 30.0))
+        if ready:
+            log(f"backend ready after {time.time() - t0:.1f}s (attempt {attempt})")
+            _splash_set_progress(98, "后端就绪，正在打开界面…")
+            break
         if _ACTIVE["cancel"]:
             break
         if proc is not None and proc.poll() is not None:
-            log(f"backend exited early with code={proc.returncode}")
-            break
-        if http_ready():
-            ready = True
-            break
-        time.sleep(0.5)
-        # 等待就绪期间进度随时间平滑推进 (65% → 95%, 封顶)
-        _splash_set_progress(min(95.0, 65.0 + (time.time() - t0) / WAIT_TIMEOUT * 30.0))
-    if ready:
-        log(f"backend ready after {time.time() - t0:.1f}s")
-        _splash_set_progress(98, "后端就绪，正在打开界面…")
+            # 进程提前退出: 清理后进入下一轮重试 (若有剩余次数)
+            if started_by_us:
+                try:
+                    kill_tree(proc.pid)
+                except Exception as ex:
+                    log(f"backend cleanup before retry failed: {ex}")
+            proc = None
+            continue
+        # 进程仍活着但超时: 不重试 (避免反复重启卡死的后端)
+        log("backend NOT ready in time")
+        if started_by_us and proc is not None:
+            kill_tree(proc.pid)
+        break
 
     if not ready:
         if _ACTIVE["cancel"]:
@@ -4411,11 +4573,20 @@ def main() -> int:
                 kill_tree(proc.pid)
             _close_splash()
             return 0
-        log("backend NOT ready in time")
+        log(f"backend failed after {attempt} attempt(s), last exit code={last_code}")
         if started_by_us and proc is not None:
             kill_tree(proc.pid)
-        log(f"backend not ready within {WAIT_TIMEOUT}s; check pnpm install in Source")
         _close_splash()
+        _show_fatal(
+            "后端启动失败",
+            f"后端服务连续 {attempt} 次启动失败（最近一次退出码 {last_code}）。\n\n"
+            "常见原因：\n"
+            "· 刚刚覆盖安装/更新，文件仍被占用或杀毒软件正在扫描 —— "
+            "等待 1~2 分钟后重新启动通常即可恢复\n"
+            "· 依赖未安装完整 —— 运行 DSH_Desktop\\00_env.bat 重新安装依赖\n"
+            "· 端口 3080 被其他程序占用\n\n"
+            f"主日志：{LOG_FILE}\n"
+            f"后端输出：{DATA_DIR / 'logs'} 目录下的 backend-*.log（本次 {_backend_log_path().name}）")
         return 1
 
     # 5) WebView2 窗口 (frameless + 原生自绘标题栏)
@@ -4543,9 +4714,9 @@ def main() -> int:
             log("form closing interception installed (close -> tray)")
         except Exception as ex:
             log(f"form closing interception failed: {ex}")
-        # 系统托盘 (右键: 显示窗口 / 退出)
+        # 系统托盘 (右键: 显示窗口 / 退出); 字体随 DPI 缩放 (bar._scale)
         try:
-            _setup_tray(window.native)
+            _setup_tray(window.native, bar._scale)
         except Exception as ex:
             log(f"tray setup failed: {ex}")
 
