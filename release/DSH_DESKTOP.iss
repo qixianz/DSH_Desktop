@@ -81,6 +81,22 @@ Name: "{autodesktop}\DSH Desktop"; Filename: "{app}\DSH_Desktop.exe"; Tasks: des
 [Run]
 Filename: "{app}\DSH_Desktop.exe"; Description: "启动 DSH Desktop"; Flags: nowait postinstall skipifsilent
 
+; Uninstall
+; The launcher intercepts window close as "hide to tray" and stays alive.
+; The uninstaller MUST kill it first, otherwise the running exe (PyInstaller
+; onefile bootloader holds an open handle on DSH_Desktop.exe) locks files and
+; the uninstall hangs / leaves residue (deepseek-harness\ + data\).
+; taskkill /T kills the whole tree: the backend node process dies with it
+; (parent-child tree + launcher's kill-on-close job), releasing all file locks.
+
+[UninstallRun]
+; 1) 先杀掉正在运行的实例 (托盘驻留也一并杀; 同名进程全杀, 含 F:\ 开发副本)
+Filename: "{sys}\taskkill.exe"; Parameters: "/IM DSH_Desktop.exe /F /T"; Flags: runhidden; StatusMsg: "正在关闭 DSH Desktop…"
+; 2) 清空只读/系统/隐藏属性, 避免删除被拒 (filesandordirs 遇只读会失败残留)
+Filename: "{sys}\cmd.exe"; Parameters: "/C attrib -r -s -h ""{app}\*.*"" /s /d >nul 2>&1"; Flags: runhidden; StatusMsg: "清除文件属性…"
+; 3) 稍等, 让系统释放文件句柄后再删除目录
+Filename: "{sys}\cmd.exe"; Parameters: "/C timeout /t 2 /nobreak >nul"; Flags: runhidden; StatusMsg: "等待进程退出…"
+
 [UninstallDelete]
 ; Delete the whole app dir including runtime-generated content:
 ; deepseek-harness/ (repo fetched on first launch) and data/ are NOT
