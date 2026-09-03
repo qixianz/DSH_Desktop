@@ -336,7 +336,7 @@ if defined MISSING (
 rem ============ [8] installer (Inno Setup) ============
 rem Produce a real installer (DSH_Desktop Setup.exe): receiver double-clicks
 rem to install; needs Inno Setup 6 (ISCC.exe), see https://jrsoftware.org/isinfo.php
-set "APP_VER=1.0.0"
+set "APP_VER=1.1.0"
 if exist "%OUT%\DSH_Desktop\last-commit.txt" (
   for /f "usebackq delims=" %%c in ("%OUT%\DSH_Desktop\last-commit.txt") do (
     set "APP_VER=0.1.0-%%c"
