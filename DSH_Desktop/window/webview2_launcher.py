@@ -358,6 +358,49 @@ def log(msg: str) -> None:
         pass
 
 
+# ==================== 深色滚动条辅助 (日志区等 WinForms 控件) ====================
+def _apply_dark_scrollbar(control, dark: bool) -> None:
+    """切换 WinForms 控件的系统滚动条配色 (深色主题下不再出现浅色白条)。
+
+    实现: uxtheme.SetWindowTheme(control, 'DarkMode_Explorer', None) 让控件
+    走 Windows 深色主题 (Win11 起支持); 浅色回退 'Explorer'。同时用
+    DWMWA_USE_IMMERSIVE_DARK_MODE(20) 开启窗口级 immersive dark mode,
+    两者配合让 RichEdit 等原生控件滚动条/滑块变深色。
+    主题切换 (apply_theme) 时需对已创建句柄的控件重新调用。
+    失败 (旧系统/控件未创建句柄) 时静默忽略, 保持默认外观。"""
+    try:
+        if control is None:
+            return
+        # 确保句柄已创建 (控件未加到 form 前 Handle 可能为 0)
+        try:
+            _ = control.Handle
+        except Exception:
+            return
+        hwnd = control.Handle.ToInt32()
+        if not hwnd:
+            return
+        uxtheme = ctypes.WinDLL("uxtheme", use_last_error=True)
+        uxtheme.SetWindowTheme.restype = ctypes.c_long
+        uxtheme.SetWindowTheme.argtypes = [
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p]
+        theme = "DarkMode_Explorer" if dark else "Explorer"
+        uxtheme.SetWindowTheme(ctypes.c_void_p(hwnd), theme, None)
+        # 窗口级 immersive dark mode (Win11 1809+; 20=UseImmersiveDarkMode)
+        try:
+            dwm = ctypes.WinDLL("dwmapi", use_last_error=True)
+            dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+            dwm.DwmSetWindowAttribute.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint,
+                ctypes.c_void_p, ctypes.c_uint]
+            val = ctypes.c_int(1 if dark else 0)
+            dwm.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd), 20, ctypes.byref(val), ctypes.sizeof(val))
+        except Exception:
+            pass
+    except Exception as ex:
+        log(f"_apply_dark_scrollbar: {ex}")
+
+
 # ==================== 日志输出区 (控制面板右侧) ====================
 # 所有 cmd 输出 (git 拉取/切换、环境更新、构建、启动) 既写文件 (log) 也
 # 实时追加到控制面板右侧日志文本框。控制面板创建后通过 _set_log_sink 注册
@@ -438,7 +481,7 @@ def _run_captured(cmd, cwd=None, env=None, timeout=None,
                   emit_lines: bool = True, prefix: str = "") -> tuple[int, list[str]]:
     """在仓库 (SOURCE) 内运行命令, 逐行捕获 stdout/stderr 追加到日志区。
 
-    替代旧的"弹独立控制台窗口" (_show_console_step / run_build): 不闪控制台,
+    全程静默 (CREATE_NO_WINDOW + SW_HIDE), 不弹任何独立控制台窗口,
     输出实时回填到控制面板右侧日志区。cmd 为 list (Popen list 模式) 或字符串。
     返回 (returncode, lines)。支持取消 (_ACTIVE["cancel"]) 与超时杀进程树。"""
     flags, si = _no_window_startup()
@@ -564,6 +607,81 @@ def read_theme_preference() -> str | None:
             return pref
     log("theme preference not found in settings document, fallback to system theme")
     return None
+
+
+def _resolve_pref_dark(pref: str | None) -> bool:
+    """把主题偏好字符串解析为「当前是否为深色」。
+
+    与 resolve_initial_dark 同规则: 'dark'=深, 'light'=浅, 'system'/None=随系统。
+    """
+    if pref == "dark":
+        return True
+    if pref == "light":
+        return False
+    return system_dark()
+
+
+def watch_theme_preference(bar, panel) -> None:
+    """后台线程: 实时监听 harness 的 settings.yaml 主题偏好变化并刷新窗口配色。
+
+    harness (DSH 前端) 在 ~/.dsh/settings.yaml 的 ui-theme.preference 切换
+    light/dark/system 时, 会持久化写回该文件。桌面端主窗口/控制面板的颜色在
+    初始用 resolve_initial_dark 确定一次, 之后没有运行时监听, 故 harness 改主题
+    后桌面端不变 (也不回控制面板时明暗不一致)。本线程以 1s 间隔轮询文件 mtime,
+    检测到变化且解析出的明暗与当前不一致时, 封送 UI 线程调用 bar.apply_theme
+    (标题栏/窗口/边框/文档背景) 与 panel.apply_theme (控制面板)。
+    只读文件, 不做任何写入 (写权归 harness)。"""
+    try:
+        # 记录偏好来源文件与其 mtime: 用于判断"文件是否变过" (避免每次重读解析)
+        dsh_home = _resolve_dsh_home()
+        settings_path = Path(dsh_home) / "settings.yaml"
+        last_mtime = 0.0
+        try:
+            if settings_path.is_file():
+                last_mtime = settings_path.stat().st_mtime
+        except OSError:
+            last_mtime = 0.0
+
+        def _ui_apply(dark: bool) -> None:
+            try:
+                from System import Action
+                if bar is not None and getattr(bar, "form", None) is not None:
+                    bar.form.Invoke(Action(lambda: _do_apply(dark)))
+                elif bar is not None:
+                    _do_apply(dark)
+            except Exception as ex:
+                log(f"theme watch ui apply failed: {ex}")
+
+        def _do_apply(dark: bool) -> None:
+            try:
+                if bar is not None and bool(getattr(bar, "_dark", True)) != dark:
+                    bar.apply_theme(dark)
+                    log(f"theme watch: titlebar -> dark={dark}")
+                if panel is not None and hasattr(panel, "apply_theme"):
+                    if bool(getattr(panel, "_dark", True)) != dark:
+                        panel.apply_theme(dark)
+                        log(f"theme watch: control panel -> dark={dark}")
+            except Exception as ex:
+                log(f"theme watch apply failed: {ex}")
+
+        # 初始快照: 不立即改 (首帧由 resolve_initial_dark 决定), 只记录当前目标
+        _do_apply(resolve_initial_dark())
+
+        while True:
+            time.sleep(1.0)
+            try:
+                mtime = settings_path.stat().st_mtime if settings_path.is_file() else 0.0
+            except OSError:
+                mtime = 0.0
+            if mtime == last_mtime:
+                continue
+            last_mtime = mtime
+            pref = read_theme_preference()
+            dark = _resolve_pref_dark(pref)
+            log(f"theme watch: settings.yaml changed (mtime={mtime}), pref={pref} -> dark={dark}")
+            _ui_apply(dark)
+    except Exception as ex:
+        log(f"theme watch stopped: {ex}")
 
 
 def system_dark() -> bool:
@@ -764,44 +882,30 @@ def needs_build() -> tuple[bool, str | None]:
     return False, cur_fp
 
 
-def _clean_build_artifacts() -> None:
-    """构建前删除仓库内旧的构建产物 (lib/ dist/ .dsh-build/ .typecheck/ *.tsbuildinfo)。
+def _clean_build_artifacts_official() -> None:
+    """调用仓库自带的 `pnpm run clean` (scripts/clean.ts) 清理构建产物。
 
-    根因: tsc -b 增量编译会把旧 lib/ 残留下来 (含已删除/重命名 API 的过时
-    import), tsdown 以 lib/ 为输入打包时报 MISSING_EXPORT (如
-    @deepseek-ai/dsh-api-remotes 的 ApiRemoteSessionNotFound 等)。每次构建前
-    清理, 保证产物与当前源码严格一致。删除范围与官方 `pnpm run clean`
-    (scripts/clean.ts) 一致, 但不依赖 tsx / node 可用性。
-    只删 gitignore 的产物目录, 跳过 node_modules / .git (不碰依赖与版本库)。"""
-    import shutil
+    官方清理通过 TS 工程引用图精确识别每个 outDir, 并一并清根级/incremental
+    的 *.tsbuildinfo, 与 `pnpm run build` 的清理语义完全同步。依赖 node_modules
+    已装 tsx 且 node 在 PATH (由 _node_env 处理)。"构建物清除"按钮用它,
+    构建过程本身不预清理 (照抄官方 build.ts)。"""
     if not SOURCE.is_dir():
         return
-    target_names = {"lib", "dist", ".dsh-build", ".typecheck"}
-    skip = {"node_modules", ".git"}
-    dirs = 0
-    files = 0
     try:
-        for dirpath, dirnames, filenames in os.walk(str(SOURCE), topdown=True):
-            dirnames[:] = [d for d in dirnames if d not in skip]
-            p = Path(dirpath)
-            if p != SOURCE and p.name in target_names:
-                try:
-                    shutil.rmtree(str(p))
-                    dirs += 1
-                    dirnames[:] = []  # 已整树删除, 不再下钻
-                except OSError as ex:
-                    log(f"clean artifacts: remove failed {p}: {ex}")
-                continue
-            for fn in filenames:
-                if fn.endswith(".tsbuildinfo"):
-                    try:
-                        (p / fn).unlink()
-                        files += 1
-                    except OSError as ex:
-                        log(f"clean artifacts: remove failed {p / fn}: {ex}")
+        clean_env = _node_env()
+        clean_env["CI"] = "true"
+        rc, _lines = _run_captured(
+            _pnpm_list(["--config.confirmModulesPurge=false",
+                        "--config.verify-deps-before-run=false",
+                        "run", "clean"]),
+            env=clean_env, timeout=1800, prefix="  ")
     except OSError as ex:
-        log(f"clean artifacts: walk failed: {ex}")
-    log(f"clean artifacts done (dirs={dirs}, files={files})")
+        log(f"clean artifacts (official): pnpm run clean failed to start: {ex}")
+        return
+    if rc == 0:
+        log("clean artifacts (official): pnpm run clean OK")
+    else:
+        log(f"clean artifacts (official): pnpm run clean failed (exit code={rc})")
 
 
 def _deps_need_update() -> bool:
@@ -820,44 +924,25 @@ def _deps_need_update() -> bool:
         return True
 
 
-def _show_console_step(title: str, body: str, cwd=None, env=None,
-                       stdin_data: str = "", timeout: float | None = None) -> bool:
-    """执行 body 中的命令 (cmd /S /c 字符串), 输出实时捕获到日志区。
-
-    原实现弹独立可见控制台窗口 (CREATE_NEW_CONSOLE); 现改为静默执行并把
-    stdout/stderr 逐行追加到控制面板右侧日志区 (需求: 所有 cmd 输出显示在
-    日志区)。body 由调用方拼完整命令串; 成功/失败以子进程返回码判定
-    (body 内的 `exit 0` 让成功路径返回 0; 失败路径靠非 0 返回码, 不再
-    pause 弹窗)。支持超时与 splash 关闭取消 (_ACTIVE["cancel"])。"""
-    _log_ui_ts("=" * 44)
-    _log_ui_ts(f"{title} 开始…" if title else "开始执行…")
-    cmd_str = 'cmd /S /c "' + body + '"'
-    rc, _lines = _run_captured(cmd_str, cwd=cwd, env=env,
-                               timeout=timeout, prefix="  ")
-    if rc == 0:
-        _log_ui_ts(f"{title} 完成。" if title else "完成。")
-    else:
-        _log_ui_ts(f"{title} 失败 (exit code={rc})。" if title else f"失败 (exit code={rc})。")
-    _log_ui_ts("=" * 44)
-    ok = rc == 0
-    log(f"console step '{title}' finished, ok={ok}")
-    return ok
-
-
 def run_build() -> bool:
     log("starting build (output captured to log panel)")
     _log_ui_ts("=" * 44)
     _log_ui_ts("前后端构建 (pnpm run build) 开始…")
-    # 构建前清理旧产物: tsc -b 增量残留的 lib/ 会让 tsdown 报 MISSING_EXPORT
-    # (旧版 API import 未随源码更新), 清理后构建 = 全新打包, 产物与源码一致。
-    _clean_build_artifacts()
+    # 完全照抄官方: 构建前不做任何清理 (官方 build.ts 不调用 clean,
+    # pnpm run clean 是独立的手动动作)。tsc -b 自行增量决定产物。
+    # 如需彻底清残留, 用户点"构建物清除"按钮 (调官方 pnpm run clean)。
     # 输出实时捕获到日志区 (不再是独立控制台弹窗)
     # CI=true: 管道捕获 (无 TTY) 时 pnpm 才不拒绝移除 modules 目录
     # (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY); 并显式禁交互确认。
     build_env = _node_env()
     build_env["CI"] = "true"
+    # verify-deps-before-run=false: 禁止 pnpm run 前自动校验并重建 node_modules
+    # (否则依赖一旦被前序操作标脏, pnpm 会整套 Recreating node_modules 重装,
+    # 十几分钟)。依赖由"运行环境检测"按钮手动 install; 构建只管编译。
     rc, _lines = _run_captured(
-        _pnpm_list(["--config.confirmModulesPurge=false", "run", "build"]),
+        _pnpm_list(["--config.confirmModulesPurge=false",
+                    "--config.verify-deps-before-run=false",
+                    "run", "build"]),
         env=build_env, timeout=None, prefix="  ")
     ok = rc == 0
     if _ACTIVE["cancel"]:
@@ -1163,29 +1248,32 @@ def _clone_repo() -> bool:
 
 
 def _install_deps() -> bool:
-    """首次安装: 弹可见 cmd 窗口执行 pnpm install (内嵌 pnpm + node)。
+    """安装环境依赖 (pnpm install): 静默在主面板日志区运行, 不弹 cmd 窗口。
 
-    依赖 store 放 data 目录不占 C 盘; 成功窗口自动关闭, 失败 pause 供查看。
-    与切换版本 / 构建统一走可见 cmd 流程 (需求: 首次启动 = 环境更新 cmd ->
-    构建 cmd, 仅无 git 切换步骤)。取消 (splash 关闭) 时终止子进程。"""
-    store = '"' + str(DATA_DIR / "pnpm-store") + '"'
-    body = (
-        "chcp 65001 >nul & set CI=true & "
-        "echo. & echo ============================================ & "
-        "echo  正在安装环境依赖 (首次启动, 需要几分钟) ... & "
-        "echo ============================================ & "
-        + _pnpm_cmd("install --config.confirmModulesPurge=false --store-dir " + store)
-        + " & echo. & echo 环境依赖安装完成 & "
-        "echo ------------- & exit 0"
-    )
-    ok = _show_console_step("环境更新 (pnpm install)", body, timeout=1800)
+    与切换版本 / 构建统一走 _run_captured (CREATE_NO_WINDOW + 输出实时透传到
+    日志区)。依赖 store 放 data 目录不占 C 盘; CI=true 让管道捕获 (无 TTY) 时
+    pnpm 不拒绝移除 modules 目录。取消 (splash 关闭) 时终止子进程。"""
+    store = str(DATA_DIR / "pnpm-store")
+    build_env = _node_env()
+    build_env["CI"] = "true"
+    _log_ui_ts("=" * 44)
+    _log_ui_ts("环境依赖安装 (pnpm install) 开始…")
+    rc, _lines = _run_captured(
+        _pnpm_list(["install",
+                    "--config.confirmModulesPurge=false",
+                    "--store-dir", store]),
+        env=build_env, timeout=1800, prefix="  ")
+    ok = rc == 0
     installed = (SOURCE / "node_modules" / ".modules.yaml").is_file()
     if ok and installed:
+        _log_ui_ts("环境依赖安装完成。")
         log("pnpm install OK (output captured)")
         return True
+    if _ACTIVE["cancel"]:
+        _log_ui_ts("环境依赖安装已取消。")
+    else:
+        _log_ui_ts(f"环境依赖安装失败 (exit code={rc})。")
     log(f"pnpm install failed (rc ok={ok}, marker={installed})")
-    if not ok and not _ACTIVE["cancel"]:
-        log("pnpm install finished with error (see log panel)")
     return False
 
 
@@ -3466,7 +3554,7 @@ class TitleBar:
 # 与既有代码的关系:
 #   - 版本切换按钮 -> show_update_dialog(titlebar) (升级对话框不变)
 #   - 构建/清除/环境检测/启动 的后台线程动作复用 run_build /
-#     _clean_build_artifacts / start_backend / _stop_backend 等;
+#     _clean_build_artifacts_official / start_backend / _stop_backend 等;
 #   - 日志 sink 通过 _set_log_sink 注册, _log_ui_ts 追加带时间戳行。
 
 
@@ -3545,6 +3633,10 @@ class ControlPanel:
         self._installed = False
         # 各按钮的启用态配色 (bg, fg, hover), 按按钮引用记录, 切换启用/禁用时还原
         self._btn_style: dict = {}
+        # 日志批量追加缓冲: append_log(任意线程) 只推行入队, 由防抖定时器
+        # 一次性 flush 到 UI 线程, 多行只触发一次重绘/滚动恢复 (消除逐行闪烁)。
+        self._log_queue: list[str] = []
+        self._log_pending = False   # 已有一次 flush 投递在排队 (合并高频行)
 
     # ---------- 主题/颜色 ----------
 
@@ -3578,6 +3670,47 @@ class ControlPanel:
             }
         rgb = pal[key]
         return Color.FromArgb(*rgb)
+
+    def apply_theme(self, dark: bool) -> None:
+        """实时切换控制面板明暗配色 (由 settings.yaml 的主题监听线程驱动)。
+
+        harness 在 ~/.dsh/settings.yaml 的 ui-theme.preference 切换 light/dark
+        (或 system 解析结果) 时, 桌面端后台线程检测到后封送到 UI 线程调用本方法:
+        更新 self._dark, 重设主面板与各控件背景/前景色, 并刷新按钮启用态配色。
+        只重着色不改布局 (控件结构不变), 因此复用 install 已建立的控件引用即可。
+        """
+        dark = bool(dark)
+        if dark == self._dark:
+            return
+        self._dark = dark
+        try:
+            if not self._installed:
+                return
+            # 主面板背景 = 主题背景色 (其子容器/按钮由下面逐一重着)
+            if self._main_panel is not None:
+                self._main_panel.BackColor = self._color("bg")
+            # 日志框: 底色/前景随明暗, 并切换深色滚动条
+            if self._log_text is not None:
+                self._log_text.BackColor = self._color("logbg")
+                self._log_text.ForeColor = self._color("fg")
+                _apply_dark_scrollbar(self._log_text, dark)
+            # 版本卡片标签 (caption=sub, tag=fg, commit=sub)
+            if self._lv_caption is not None:
+                self._lv_caption.ForeColor = self._color("sub")
+            if self._lv_version is not None:
+                self._lv_version.ForeColor = self._color("fg")
+            if self._lv_commit is not None:
+                self._lv_commit.ForeColor = self._color("sub")
+            # 更新徽章 (有更新红点图) 随主题重绘
+            if self._badge is not None:
+                try:
+                    self._badge.Invalidate()
+                except Exception:
+                    pass
+            # 按钮启用态配色随主题刷新 (含取消按钮红/灰样式)
+            self.refresh_buttons()
+        except Exception as ex:
+            log(f"control panel apply_theme failed: {ex}")
 
     # ---------- 安装 (UI 线程) ----------
 
@@ -3735,10 +3868,20 @@ class ControlPanel:
             txt.ScrollBars = _RBS(3)   # Both (0=None 1=Horizontal 2=Vertical 3=Both)
         except Exception:
             pass
-        txt.HideSelection = False
+        # HideSelection=True: 日志区失焦时不显示/不跟随插入点, 否则 AppendText
+        # 把 caret 推到文末后, RichEdit 会持续滚动视口保持 caret 可见 -> 视口被
+        # 拽着"一跳一跳"。看历史时 caret 也留在视口内, 不会被文末拖走。
+        txt.HideSelection = True
         txt.DetectUrls = False
         self._ctrls.append(txt)
         self._log_text = txt
+        # 日志框滚动条随主题明暗: 深色主题下系统滚动条是浅色白条, 很突兀。
+        # 用 uxtheme.SetWindowTheme 把 RichEdit 切到深色主题, 滚动条/滑块变深色
+        # (Win11 支持; 旧系统/失败时静默忽略, 保持默认外观)。
+        try:
+            _apply_dark_scrollbar(txt, self._dark)
+        except Exception as ex:
+            log(f"dark scrollbar apply failed: {ex}")
 
         # ---------- Grid 布局 (TableLayoutPanel 嵌套网格) ----------
         # 原手动 SetBounds 绝对定位废弃 (且曾因 tag_top 未定义导致 layout 失效):
@@ -4039,28 +4182,120 @@ class ControlPanel:
     # ---------- 日志 ----------
 
     def append_log(self, text: str) -> None:
-        """日志 sink 回调 (任意线程): 追加到日志区并自动滚动到底。"""
+        """日志 sink 回调 (任意线程): 追加到日志区。
+
+        不做逐行 UI 封送 —— 把行推入缓冲队列并调度一次 UI flush;
+        已有一个 flush 在排队时只入队 (多行合并成一次 AppendText +
+        一次判底/滚动, 消除逐行闪烁)。判底逻辑不变: 用户停在底部才
+        跟随滚动, 否则保持滚动位置 (与 cmd 一致)。"""
+        try:
+            if text is None:
+                return
+            self._log_queue.append(str(text))
+            if len(self._log_queue) > 8000:
+                del self._log_queue[: len(self._log_queue) - 8000]
+            self._schedule_log_flush()
+        except Exception:
+            pass
+
+    def _schedule_log_flush(self) -> None:
+        """在 UI 线程调度一次 flush; 已有 pending 则合并 (高频流只重绘一次)。
+
+        注意: 本方法可能被后台线程调用, 绝不能在这里创建/操作 WinForms
+        Timer (Timer 依赖创建线程的消息泵, 后台线程建了 Tick 永不触发)。
+        统一用 form.BeginInvoke 把 flush 投递到 UI 线程执行。"""
+        if self._log_pending:
+            return
+        self._log_pending = True
         try:
             from System import Action
         except Exception:
+            self._log_pending = False
+            return
+        form = self.form
+        if form is None:
+            self._log_pending = False
             return
         try:
-            def _do() -> None:
-                txt = self._log_text
-                if txt is None:
-                    return
-                try:
-                    txt.AppendText(str(text) + "\r\n")
+            if not form.InvokeRequired:
+                # 已在 UI 线程: 直接刷 (同步)
+                self._flush_log_queue_now()
+            else:
+                # 后台线程: 异步投递, 不阻塞日志生产方
+                form.BeginInvoke(Action(self._flush_log_queue_now))
+        except Exception:
+            self._log_pending = False
+
+    def _flush_log_queue_now(self) -> None:
+        """UI 线程执行: 一次性把缓冲日志写入 RichTextBox (含滚动/重绘)。
+
+        执行完必须复位 _log_pending, 否则后续行永远不再投递 (日志全丢);
+        若执行期间又有新行入队, 再投递一次, 防止竞态丢行。"""
+        try:
+            txt = self._log_text
+            lines = None
+            if txt is not None:
+                lines = self._log_queue
+                self._log_queue = []
+            if not lines:
+                return
+            hwnd = txt.Handle.ToInt32()
+            from System.Drawing import Point as _Pt
+            # 判底 + 记录追加前视口首行的字符锚点。
+            # 追加只在文档尾部增加行, 已有行的字符索引/行号保持稳定,
+            # 因此用该锚点把 caret 钉回原视口 —— 不依赖 EM_GETSCROLLPOS
+            # 内部坐标 (它在真实异步刷新下会漂移, 导致视口被甩到顶部)。
+            try:
+                w = txt.ClientSize.Width
+                h = txt.ClientSize.Height
+                bottom_idx = txt.GetCharIndexFromPosition(_Pt(w - 2, h - 2))
+                last_idx = max(0, txt.TextLength - 1)
+                at_bottom = txt.GetLineFromCharIndex(bottom_idx) >= txt.GetLineFromCharIndex(last_idx)
+                top_anchor = txt.GetCharIndexFromPosition(_Pt(0, 0))
+                top_line = txt.GetLineFromCharIndex(top_anchor)
+            except Exception:
+                at_bottom = False
+                top_line = -1
+            # 根治闪烁: 整个追加+滚动期间关闭 RichEdit 重绘
+            # (WM_SETREDRAW=0), 全程不画, 做完最后一次重绘, 不再逐行白闪。
+            user32 = ctypes.windll.user32
+            user32.SendMessageW(hwnd, 0x000B, 0, 0)   # WM_SETREDRAW FALSE
+            try:
+                txt.AppendText("".join(s + "\r\n" for s in lines))
+                if at_bottom:
+                    # 原本在底部: 跟随新内容滚到底 (保持"看到最新")
                     txt.SelectionStart = txt.TextLength
                     txt.ScrollToCaret()
-                except Exception:
-                    pass
-            if self.form.InvokeRequired:
-                self.form.Invoke(Action(_do))
-            else:
-                _do()
+                elif top_line >= 0:
+                    # 不在底部 (用户往上滚/看历史) 时视口钉住原位置: 把 caret
+                    # 移回追加前视口首行 (而非留在文末)。AppendText 会把 caret
+                    # 推到文末并触发 caret-可见滚动把视口拖走; 这里在重绘恢复前
+                    # 把 caret 拉回原视口内, RichEdit 的"保持 caret 可见"逻辑
+                    # 便不会滚动, 新日志追加在尾部不会推走正在看的内容
+                    # (与 IDEA/VSCode 控制台的"智能跟随"一致, 不依赖 Focus)。
+                    try:
+                        anchor = txt.GetFirstCharIndexFromLine(top_line)
+                        txt.SelectionStart = max(0, min(anchor, txt.TextLength - 1))
+                        txt.SelectionLength = 0
+                    except Exception:
+                        pass
+            finally:
+                user32.SendMessageW(hwnd, 0x000B, 1, 0)   # WM_SETREDRAW TRUE
+                txt.Invalidate()   # 一次性重绘整个控件
         except Exception:
             pass
+        finally:
+            # 复位 pending 并检查是否有执行期间新入队的行 (竞态防丢)
+            self._log_pending = False
+            if self._log_queue:
+                try:
+                    from System import Action
+                    form = self.form
+                    if form is not None and not form.IsDisposed:
+                        self._log_pending = True
+                        form.BeginInvoke(Action(self._flush_log_queue_now))
+                except Exception:
+                    self._log_pending = False
 
     def _append_log_ui_bulk(self, text: str) -> None:
         """UI 线程批量回填 (install 时调用, 不逐行滚动)。"""
@@ -4074,6 +4309,9 @@ class ControlPanel:
 
     def clear_log(self) -> None:
         """只清空框内日志, 不动磁盘文件。"""
+        # 清空缓冲队列, 避免清空后又刷出缓冲里的旧行
+        self._log_queue = []
+        self._log_pending = False
         try:
             from System import Action
             def _do() -> None:
@@ -4274,7 +4512,7 @@ class ControlPanel:
             try:
                 _log_ui_ts("=" * 44)
                 _log_ui_ts("构建物清除开始…")
-                _clean_build_artifacts()
+                _clean_build_artifacts_official()
                 # 使构建指纹失效: 下次 build 后重新记录 (清除后产物缺失)
                 try:
                     if MARKER.exists():
@@ -4370,6 +4608,17 @@ class ControlPanel:
     def _enter_webview(self, web_url: str) -> None:
         """UI 线程: 隐藏控制面板, webview 加载后端页面覆盖内容区。"""
         try:
+            # load_url 前先把 WebView2 控件底色设为主题色: 后端页面导航
+            # 期间控件底色会被重置为默认白, 深色主题下加载瞬间会曝出白底。
+            try:
+                c = self._color("bg")
+                wv = getattr(self.titlebar, "_webview_ctrl", None)
+                if wv is not None:
+                    from System.Drawing import Color as _GColor
+                    wv.DefaultBackgroundColor = _GColor.FromArgb(
+                        int(c.R), int(c.G), int(c.B))
+            except Exception as ex:
+                log(f"webview enter bg color failed: {ex}")
             self.hide()
             self.window.load_url(web_url)
             log(f"webview entered: {web_url}")
@@ -4409,12 +4658,84 @@ class ControlPanel:
         threading.Thread(target=_work, daemon=True).start()
 
     def _exit_webview(self) -> None:
-        """UI 线程: webview 关闭内容 (about:blank), 显露控制面板。"""
-        try:
-            self.window.load_url("about:blank")
-        except Exception as ex:
-            log(f"webview close failed: {ex}")
+        """UI 线程: 隐藏 webview, 显露控制面板。
+
+        不再 load_html 注入过渡页: WebView2 每次导航都会先把控件底色重置
+        为默认白色 (DefaultBackgroundColor), 且导航是异步的 —— 若 DSH 刚
+        启动 (load_url 的 harness 导航尚未完成) 就被停止, 两个导航竞争,
+        WebView2 会渲染出白底"加载页" (中间内容 + 四周白), 而面板 (WinForms
+        控件) 盖不住 airspace 原生窗口的残留渲染。反正退出后 webview 必须
+        隐藏 (见 _toggle_webview), 过渡页本不可见, 直接隐藏即可, 彻底消灭
+        白页与导航竞态。"""
+        # 1) 先隐藏 webview + 显示面板 (顺序固定: 面板露出前必须先隐藏
+        #    airspace 原生窗口, 否则残留的白色过渡页会盖住面板内容)
         self.show()
+        # 2) 双保险: 置底并再次确保隐藏 (airspace 残留渲染兜底)
+        try:
+            wv = getattr(self.titlebar, "_webview_ctrl", None)
+            if wv is not None:
+                wv.Visible = False
+                wv.SendToBack()
+        except Exception as ex:
+            log(f"webview exit hide failed: {ex}")
+        # WebView2 导航 (含停止前未完成的 harness 导航) 会异步重置父窗口的
+        # DWM 属性 (1px 边框色 / NCR / 圆角), 重置发生在导航渲染完成后
+        # (数秒内), 单次施加赶不上; 且 _apply_border_color/_apply_ncr_state
+        # 只在 install 与 Resize 时被调用, 回面板不触发 Resize。这里于 UI 线程
+        # 恢复窗口背景 + 边框 + 全窗口重绘, 再用 daemon 线程延迟多次重试
+        # 覆盖导航完成的异步重置。
+        def _reapply_chrome() -> None:
+            try:
+                from System import Action
+
+                def _apply() -> None:
+                    try:
+                        bar = getattr(self, "titlebar", None)
+                        if bar is None:
+                            return
+                        form = getattr(self, "form", None)
+                        # 1) 窗口客户区背景 = 主题色 (面板外露边缘/标题栏底座)
+                        try:
+                            form.BackColor = bar._color("bg")
+                        except Exception:
+                            pass
+                        # 2) DWM 1px 边框色 + NCR/圆角 (导航可能已重置)
+                        bar._apply_border_color()
+                        bar._apply_ncr_state()
+                        # 3) 自绘标题栏 + 全窗口重绘, 清掉残留白底
+                        try:
+                            bar._invalidate_titlebar()
+                            form.Invalidate()
+                            form.Update()
+                        except Exception:
+                            pass
+                        # 4) WebView2 控件底色对齐主题 (隐藏状态下导航仍会重置)
+                        try:
+                            c = bar._color("bg")
+                            wv = getattr(bar, "_webview_ctrl", None)
+                            if wv is not None:
+                                from System.Drawing import Color as _GColor
+                                wv.DefaultBackgroundColor = _GColor.FromArgb(
+                                    int(c.R), int(c.G), int(c.B))
+                        except Exception:
+                            pass
+                        log("webview exit chrome reapplied (bg/border/ncr/invalidate)")
+                    except Exception as ex:
+                        log(f"webview exit border recolor failed: {ex}")
+
+                # 首次也在 UI 线程同步施加 (跨线程改控件不可靠)
+                try:
+                    self.form.Invoke(Action(_apply))
+                except Exception as ex:
+                    log(f"webview exit chrome first apply failed: {ex}")
+                # 导航渲染完成的异步重置可能晚于首次: 延长重试窗口
+                for delay in (1.0, 2.0, 4.0, 8.0, 16.0, 30.0):
+                    time.sleep(delay)
+                    self.form.Invoke(Action(_apply))
+            except Exception as ex:
+                log(f"webview exit dwm retry failed: {ex}")
+
+        threading.Thread(target=_reapply_chrome, daemon=True).start()
         log("control panel restored")
 
     # ---------- 动作: 重启 DSH ----------
@@ -4476,9 +4797,8 @@ class ControlPanel:
     def _on_cancel(self) -> None:
         """取消进行中的 环境检测/前后端构建/构建物清除 等命令。
 
-        设置 _ACTIVE["cancel"] 让 _run_captured / _show_console_step 的
-        循环自行终止, 同时立即杀掉当前活动子进程树 (taskkill /T /F)
-        中断阻塞的 subprocess.run 阶段。"""
+        设置 _ACTIVE["cancel"] 让 _run_captured 的循环自行终止, 同时立即
+        杀掉当前活动子进程树 (taskkill /T /F) 中断阻塞的 subprocess.run 阶段。"""
         if not self._busy:
             return
         try:
@@ -5018,12 +5338,12 @@ def check_for_update() -> dict | None:
 def perform_update(target_ref: str, progress=None, demo: bool = False) -> tuple[bool, str]:
     """把仓库强制切换到 target_ref (本地已存在的 commit/ref)。
 
-    可见 cmd 流程 (每步独立弹窗, 完成自动关闭, 失败 pause 供查看):
-      1. git cmd: 校验目标本地存在 -> checkout -f 强制切换 -> 打印新 HEAD
-         (显示"切换完成"后窗口自动关闭);
-      2. 环境更新: lockfile 与已安装依赖不一致时弹出 pnpm install cmd
-         ("环境更新完成"后自动关闭); 无环境更新则跳过;
-      3. 返回后由调用方 (_start_rebuild_after_switch) 弹出构建 cmd。
+    全程静默 (走 _run_captured / run_build, 输出进控制面板日志区, 不弹 cmd):
+      1. git: 校验目标本地存在 -> checkout -f 强制切换 -> 打印新 HEAD
+         (主面板日志区显示"切换完成");
+      2. 完成: 记录新 commit 并失效构建指纹, 不自动安装依赖 (pnpm install)
+         也不自动构建 (pnpm run build); 这两步由用户通过"运行环境检测"/
+         "前后端构建"按钮手动触发。
     切换后处于 detached HEAD。切换仅针对本地已有提交 (fetch 由后台更新
     检测线程 / 对话框"获取最新仓库"按钮负责)。
     返回 (ok, message)。progress(msg) 可选回调 (后台线程调用, 调用方负责封送)。"""
@@ -5043,27 +5363,32 @@ def perform_update(target_ref: str, progress=None, demo: bool = False) -> tuple[
         return True, "演示模式: 已完成, 未修改任何代码。"
 
     ref12 = target_ref[:12]
-    gb = _git_bin()
-    git_exec = f'"{gb}"' if (os.path.isabs(gb) or " " in gb) else gb
-    src = '"' + str(SOURCE) + '"'
 
     # ---- 1) 执行 git 切换: 校验 + 切换 + 打印新 HEAD, 输出进日志区 ----
     _say(f"切换版本到 {ref12} …")
-    git_body = (
-        "chcp 65001 >nul & "
-        "echo. & echo ============================================ & "
-        f"echo  正在切换版本: {ref12} ... & "
-        "echo ============================================ & "
-        f"{git_exec} -C {src} rev-parse --verify --quiet {target_ref} && "
-        f"{git_exec} -C {src} checkout -q -f {target_ref} && "
-        "echo. & echo 切换完成: & "
-        f"{git_exec} -C {src} log -1 --format=\"   %h %s\" & "
-        "echo. & echo ------------- & exit 0"
-    )
-    if not _show_console_step("切换版本 (git checkout)", git_body, timeout=300):
+    # 直接执行 git, 把真实输出打到日志区 (不弹窗、无人工 echo 装饰)。
+    # 用 _git() 复用系统/内嵌 git 与代理回退; 输出经 _log_ui_ts 显示。
+    def _git_show(args: list[str]) -> int:
+        rc, out, err = _git(args, timeout=300)
+        if out.strip():
+            _log_ui_ts("  " + out.rstrip())
+        if err.strip():
+            _log_ui_ts("  " + err.rstrip())
+        return rc
+
+    # 校验目标本地存在; 失败则不切换 (与原来 rev-parse && checkout 链式一致)
+    chk = _git_show(["rev-parse", "--verify", "--quiet", target_ref])
+    if chk != 0:
         return False, ("切换版本失败: target=" + ref12
                        + "\n\n强制切换会丢弃工作区未提交的改动。"
                        + "\n请查看日志区中的错误信息。")
+    co_rc = _git_show(["checkout", "-q", "-f", target_ref])
+    if co_rc != 0:
+        return False, ("切换版本失败: target=" + ref12
+                       + "\n\n强制切换会丢弃工作区未提交的改动。"
+                       + "\n请查看日志区中的错误信息。")
+    _log_ui_ts("切换完成:")
+    _git_show(["log", "-1", "--format=   %h %s"])
 
     new_r = _git(["rev-parse", "HEAD"])
     new_head = new_r[1].strip() if new_r[0] == 0 else "?"
@@ -5081,35 +5406,22 @@ def perform_update(target_ref: str, progress=None, demo: bool = False) -> tuple[
     except OSError as ex:
         log(f"update: fingerprint invalidate failed: {ex}")
 
-    # ---- 2) 环境更新: lockfile 与已装依赖不一致才弹可见 pnpm install cmd ----
+    # ---- 2) 完成: 记录新 commit, 失效构建指纹 ----
+    # 不自动安装依赖 (pnpm install) 也不自动构建 (pnpm run build):
+    # 切换版本只管切, 环境/构建由用户通过"运行环境检测"/"前后端构建"
+    # 按钮手动触发, 避免"只是切个 commit 就环境构筑"。
     msg = f"已切换到 {new_head[:12]}（强制切换，工作区改动已丢弃）。"
-    if _deps_need_update():
-        _say("安装依赖 (pnpm install) …")
-        # 关键: pnpm install 前先停掉旧后端进程, 释放 node_modules 里的
-        # 文件锁 (Windows 上运行中的后端会锁住 .js/.node, 导致删除/重建
-        # 报 EPERM/EBUSY 失败)。构建完成后 _restart_backend_blocking 会
-        # 重新启动新后端的产物。
-        _stop_backend()
-        store = '"' + str(DATA_DIR / "pnpm-store") + '"'
-        install_body = (
-            "chcp 65001 >nul & set CI=true & "
-            "echo. & echo ============================================ & "
-            "echo  正在更新环境依赖 (pnpm install) ... & "
-            "echo ============================================ & "
-            + _pnpm_cmd("install --config.confirmModulesPurge=false --store-dir " + store)
-            + " && echo. & echo 环境更新完成 & "
-            "echo ------------- & exit 0"
-        )
-        if not _show_console_step("环境更新 (pnpm install)", install_body, timeout=1800):
-            log("update: pnpm install failed (see log panel)")
-            msg += "依赖安装未完成 (pnpm install 失败)，重新构建可能失败。"
-        else:
-            msg += "依赖已更新。"
-    else:
-        log("update: dependency lockfile unchanged, skip pnpm install")
-        msg += "依赖无更新，无需重新安装。"
+    # 使构建指纹失效: 下次"DSH 启动"或"前后端构建"会检测到源码变化而重建;
+    # 若用户不构建, 当前仍用旧产物, 需手动触发。
+    try:
+        if MARKER.exists():
+            MARKER.unlink()
+            log("update: build fingerprint invalidated (rebuild on next build/start)")
+    except OSError as ex:
+        log(f"update: fingerprint invalidate failed: {ex}")
     _say("完成")
-    return True, msg + "正在重新构建后端…"
+    log("update: switch done, deps/build left to user manual trigger")
+    return True, msg + "已切换版本。请在控制面板点\"运行环境检测\"或\"前后端构建\"后重新启动。"
 
 
 def _wait_backend_ready(timeout: float | None = None) -> bool:
@@ -5192,10 +5504,11 @@ def _reload_webview() -> None:
 
 
 def _start_rebuild_after_switch(titlebar) -> None:
-    """切换版本成功后立即执行: 重新构建后端 -> 重启后端 -> 重开画面。
+    """[备用] 切换版本成功后自动重建后端 -> 重启后端 -> 重开画面。
 
-    后台线程执行; 期间主界面保持"版本切换中…"覆盖层, 页面刷新后自动
-    消失 (新页面没有覆盖层 div)。构建失败: 提示用户 (代码已切换,
+    当前版本切换不再自动重建 (只 git checkout, 依赖/构建由用户手动触发),
+    本函数保留备用。后台线程执行; 期间主界面保持"版本切换中…"覆盖层,
+    页面刷新后自动消失。构建失败: 提示用户 (代码已切换,
     需在控制面板点"前后端构建"手动重试, 当前仍用旧后端)。"""
     def _ui(fn) -> None:
         # 封送到主窗口 UI 线程 (titlebar.form 是主窗口, 升级对话框已关闭)
@@ -5265,8 +5578,8 @@ def _restart_application() -> None:
     """延迟 3 秒重启 exe (等本进程退出、释放单实例 Mutex 后再启动新实例)。
 
     用独立的 powershell 进程做延迟启动 (本进程退出后它仍存活)。
-    注: 版本切换已改为切换后自动重建重开画面 (_start_rebuild_after_switch),
-    本函数当前无调用者, 保留备用 (如构建失败后提供"立即重启"选项)。"""
+    注: 版本切换已改为只切换不自动重建, 本函数当前无调用者, 保留备用
+    (如构建失败后提供"立即重启"选项)。"""
     if getattr(sys, "frozen", False):
         exe = Path(sys.executable)
     else:
@@ -6245,7 +6558,8 @@ def _build_update_dialog(titlebar) -> "object | None":
     def _finish_update(ok: bool, msg: str, demo_mode: bool) -> None:
         """切换流程收尾 (对话框已关闭, 由主窗口 UI 线程调用)。
 
-        成功: 保持覆盖层 -> 自动重建并重开画面 (demo 模式仅移除覆盖层);
+        成功: 移除覆盖层 + 刷新版本显示 (demo 模式仅移除覆盖层);
+        不自动重建 (依赖/构建由用户手动触发)。
         失败: 移除覆盖层 + 弹窗提示。"""
         try:
             if ok:
@@ -6254,7 +6568,18 @@ def _build_update_dialog(titlebar) -> "object | None":
                     if hide is not None:
                         hide()
                 else:
-                    _start_rebuild_after_switch(titlebar)
+                    # 只切换版本, 不自动重建: 依赖/构建由用户手动触发
+                    hide = getattr(titlebar, "_hide_updating_overlay", None)
+                    if hide is not None:
+                        hide()
+                    _refresh_panel_after_switch(titlebar)
+                    try:
+                        from System.Windows.Forms import (
+                            MessageBox, MessageBoxButtons, MessageBoxIcon)
+                        MessageBox.Show(titlebar.form, msg, "版本切换完成",
+                                        MessageBoxButtons.OK, MessageBoxIcon.Information)
+                    except Exception:
+                        pass
                 return
             hide = getattr(titlebar, "_hide_updating_overlay", None)
             if hide is not None:
@@ -6269,8 +6594,9 @@ def _build_update_dialog(titlebar) -> "object | None":
 
     def _start_update() -> None:
         target = _target_ref()
-        # 点击"切换版本": 立即关闭升级对话框, 切换与重建全程在后台进行,
-        # 主界面显示"版本切换中…"覆盖层 (页面刷新后自动消失)
+        # 点击"切换版本": 立即关闭升级对话框, 切换在后台进行 (只 git checkout,
+        # 不自动重建; 依赖/构建由用户手动触发)。主界面显示"版本切换中…"覆盖层
+        # 屏蔽点击, 切换完成后移除。
         form.DialogResult = DialogResult.OK
         form.Close()
         show_overlay = getattr(titlebar, "_show_updating_overlay", None)
@@ -6798,9 +7124,6 @@ def main() -> int:
     # 启动前 patch pywebview WinForms: BrowserForm 在 Load 事件 (窗口显示前)
     # 同步设置 DWM 边框色=背景色, 消灭启动瞬间的 1px 白框闪烁。
     _patch_winforms_browser_form()
-    # 防 UI 线程死锁: pywebview evaluate_js 同步等待在 UI 线程调用会死锁
-    # (窗体卡死但页面在动), patch 成异步 fire-and-forget。
-    pass  # evalpatch disabled (封送 UI 线程后不再需要)
     # 响应注入文档背景色 (消灭启动白屏), 见 _patch_on_webview_ready。
     _patch_on_webview_ready()
 
@@ -6914,6 +7237,19 @@ def main() -> int:
             _MAIN_FORM = window.native
         except Exception as ex:
             log(f"main form ref failed: {ex}")
+        # 实时主题监听: harness 改 ~/.dsh/settings.yaml 的 ui-theme.preference
+        # (light/dark/system) 时, 后台线程轮询到变化并刷新标题栏+控制面板配色。
+        # bar/panel 任一为 None (安装失败) 也不受影响, 尽力而为。
+        try:
+            threading.Thread(
+                target=watch_theme_preference,
+                args=(bar, panel),
+                daemon=True,
+                name="theme-watch",
+            ).start()
+            log("theme preference watcher started")
+        except Exception as ex:
+            log(f"theme preference watcher start failed: {ex}")
         # 拦截窗口关闭 (X 按钮/Alt+F4): 非退出模式 -> 隐藏到托盘
         try:
             form = window.native
