@@ -39,9 +39,9 @@ set "REPO_SRC=%DEV_ROOT%\deepseek-harness"
 
 
 rem ============ [1] dev environment check ============
-if not exist "%DEV_BUILD%\window\webview2_launcher.py" (
+if not exist "%DEV_BUILD%\window\dsh_launcher\__main__.py" (
   echo [FAILED] dev build dir not found: %DEV_BUILD%
-  echo          Expected DSH_Desktop\window\webview2_launcher.py next to release\.
+  echo          Expected DSH_Desktop\window\dsh_launcher\ next to release\.
   pause
   exit /b 1
 )
@@ -240,7 +240,9 @@ goto NODE_END
 rem ============ [5.7] bundled pnpm (standalone win32-x64 zip) ============
 rem The repo node_modules does not contain pnpm itself (corepack/system pnpm
 rem does not add it), so the release bundles the pnpm standalone
-rem (pnpm.exe + dist\; unpacked as a whole). Version pinned to the repo
+rem (pnpm.exe + dist\; unpacked as a whole). The launcher runs dist\pnpm.mjs
+rem with the bundled Node instead of pnpm.exe's embedded runtime so TLS behavior
+rem matches its registry probe. Version pinned to the repo
 rem package.json packageManager value (currently v11.7.0) so pnpm does not
 rem auto-switch/download on version mismatch.
 set "PPNPM_DIR=%OUT%\DSH_Desktop\portable\pnpm"
@@ -290,13 +292,19 @@ exit /b 1
 echo Bundled pnpm already present: %PPNPM%
 goto PNPM_END
 :PNPM_END
+if not exist "%PPNPM_DIR%\dist\pnpm.mjs" (
+  echo [FAILED] bundled pnpm.mjs missing; the launcher needs it to run pnpm with bundled Node.
+  pause
+  exit /b 1
+)
 
 
 
 
 rem ============ [6] support files ============
 mkdir "%OUT%\DSH_Desktop\window" >nul 2>&1
-copy /y "%DEV_BUILD%\window\webview2_launcher.py" "%OUT%\DSH_Desktop\window\" >nul
+mkdir "%OUT%\DSH_Desktop\window\dsh_launcher" >nul 2>&1
+copy /y "%DEV_BUILD%\window\dsh_launcher\*.py" "%OUT%\DSH_Desktop\window\dsh_launcher\" >nul
 copy /y "%DEV_BUILD%\window\DSH_Desktop.spec" "%OUT%\DSH_Desktop\window\" >nul
 copy /y "%DEV_BUILD%\window\*.ico" "%OUT%\DSH_Desktop\window\" >nul
 copy /y "%DEV_BUILD%\window\*.png" "%OUT%\DSH_Desktop\window\" >nul
@@ -314,7 +322,7 @@ copy /y "%DEV_BUILD%\01_dsh-window-build.bat" "%OUT%\DSH_Desktop\" >nul
 rem ============ [7] verify ============
 set "MISSING="
 if not exist "%OUT%\DSH_Desktop.exe" set "MISSING=%MISSING% DSH_Desktop.exe"
-if not exist "%OUT%\DSH_Desktop\window\webview2_launcher.py" set "MISSING=%MISSING% DSH_Desktop\window\webview2_launcher.py"
+if not exist "%OUT%\DSH_Desktop\window\dsh_launcher\__main__.py" set "MISSING=%MISSING% DSH_Desktop\window\dsh_launcher"
 if defined MISSING (
   echo [FAILED] missing in package:%MISSING%
   pause

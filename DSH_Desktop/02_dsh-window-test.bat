@@ -46,7 +46,7 @@ rem ============ [3] run the launcher ============
 echo Starting DSH TEST window (mutex: %DSH_SINGLE_INSTANCE%, port: %DSH_PORT%) ...
 echo NOTE: the real DSH keeps running untouched.
 cd /d "%~dp0window"
-"%VENV_PY%" webview2_launcher.py
+"%VENV_PY%" -m dsh_launcher
 set "RC=%ERRORLEVEL%"
 cd /d "%~dp0"
 if not "%RC%"=="0" if not "%RC%"=="1" (

@@ -7,7 +7,7 @@ pyinstaller-build/
 # Build staging output (kept under DSH_Desktop/window/);
 # keep the launcher sources (tracked explicitly below)
 DSH_Desktop/window/*
-!DSH_Desktop/window/webview2_launcher.py
+!DSH_Desktop/window/dsh_launcher/
 !DSH_Desktop/window/DSH_Desktop.spec
 !DSH_Desktop/window/deepseek娘.png
 !DSH_Desktop/window/deepseek娘.ico

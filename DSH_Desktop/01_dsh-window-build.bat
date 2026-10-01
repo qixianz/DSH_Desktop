@@ -3,7 +3,7 @@ setlocal EnableDelayedExpansion
 rem DeepSeek Harness window exe ONE-CLICK rebuild (PyInstaller)
 rem
 rem Repo fetch / backend deps / backend build are all handled by the exe
-rem at startup (clone / pnpm install / pnpm build live in webview2_launcher.py).
+rem at startup (clone / pnpm install / pnpm build live in window\dsh_launcher\build.py).
 rem This script ONLY packages the window exe:
 rem   [1] write the shared paths file (paths.env)
 rem   [2] venv: auto-create DSH_Desktop\.venv, auto-install PyInstaller+pywebview

@@ -38,12 +38,13 @@ if not os.path.exists(icon_path):
     print('[WARN] icon not found: %s, building without icon' % icon_path)
     icon_path = None
 
-# 入口脚本: 用绝对路径 (spec 与 launcher 同目录), 不依赖 PyInstaller 的 cwd
-entry_script = os.path.join(SPEC_DIR, 'webview2_launcher.py')
+# 入口脚本: 用绝对路径 (dsh_launcher 包在 spec 同目录), 不依赖 PyInstaller 的 cwd。
+# pathex 加 SPEC_DIR, 让 Analysis 能解析 `from dsh_launcher.xxx import ...` 并收进整个包。
+entry_script = os.path.join(SPEC_DIR, 'dsh_launcher', '__main__.py')
 
 a = Analysis(
     [entry_script],
-    pathex=[],
+    pathex=[SPEC_DIR],
     binaries=[(dll, '.') for dll in ssl_dlls],
     datas=[],
     hiddenimports=[],
